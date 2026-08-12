@@ -65,7 +65,7 @@ Local Workspace (sandbox_mode=workspace-write, approval_policy=never)
 
 前置条件：
 
-- `codex` CLI 在 PATH（本机为 `codex 0.147.0`，macOS arm64 实测）
+- `codex` CLI 在 PATH（实测环境：macOS arm64 + `codex 0.147.0`）
 - DeepSeek provider 已配置（见下文「Codex / DeepSeek 配置」）
 - `ngrok` 已安装、已 `ngrok config add-authtoken`、有一个固定域名
 - Python 3.8+
@@ -213,7 +213,7 @@ tests/
   test_config_propagation.py  离线单测：spawn 参数包含 approval/sandbox override
   test_bridge_core.py         集成测试：start/continue/observe/interrupt/进程退出（5 场景）
   test_bridge_actions.py      集成测试：7 个 action（含 steer 排队语义）
-  test_http_api.py            集成测试：HTTP API + openapi 校验（12 场景）
+  test_http_api.py            集成测试：HTTP API + openapi 校验（12 个场景）
 openapi.yaml            公共 Actions 模板（servers URL 为占位符）
 schemas/                codex app-server 协议 JSON Schema（v1/v2，参考用）
 ```
@@ -221,6 +221,7 @@ schemas/                codex app-server 协议 JSON Schema（v1/v2，参考用�
 ## V1 状态
 
 - 版本 `1.0.0`（`bridge.__version__`、`openapi.yaml`、app-server initialize clientInfo 一致）。
-- 离线单测：`python3 tests/test_config_propagation.py`（2 项，无需真实 app-server）。
-- 集成测试需要真实 app-server + DeepSeek key：`python3 tests/test_bridge_core.py`、`python3 tests/test_bridge_actions.py`、`python3 tests/test_http_api.py`。最近一次完整记录（2026-08-11）为全 PASS：core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6。
+- 已发布：GitHub Release `v1.0.0`（`Xin-Jiaqi/local-codex-bridge`，public，BSD-3-Clause；tag `v1.0.0` 指向 `fa82e91`）。
+- 离线单测（当前可复现，无需 app-server）：`python3 tests/test_config_propagation.py`（2 项）。
+- 集成测试需要真实 app-server + DeepSeek key，无 CI 自动化、未在发布后复跑：`python3 tests/test_bridge_core.py`、`python3 tests/test_bridge_actions.py`、`python3 tests/test_http_api.py`。最近一次完整实测（2026-08-11）为全 PASS：core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6（历史记录）。当前 `test_http_api.py` 含 12 个唯一场景（含 openapi 校验，部署副本缺失/占位按通过处理），与历史记录的差异未复跑确认。
 - 已实测能力：start/continue/observe/steer/interrupt/list/read、本地读写、shell、native thread 连续工作、Bearer API Key、workspace-write + approval_policy=never、Bridge/ngrok 后台启动、PID 管理、stop 隔离、health checks、完整 stop→start→health 生命周期。

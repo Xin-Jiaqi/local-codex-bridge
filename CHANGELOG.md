@@ -1,16 +1,26 @@
 # Changelog
 
-本项目无 git 历史（尚未 `git init`），1.0.0 之前的条目根据本地源码与 2026-08-11 测试报告重建，
-日期为近似值。
+1.0.0 之前的条目根据本地源码与 2026-08-11 测试报告重建，日期为近似值；
+仓库自 2026-08-12 起纳入 git 管理（v1.0.0，分支 `main`）。
 
 ## [1.0.0] - 2026-08-12
 
 ### 版本与发布准备
 - 版本统一为 `1.0.0`：`bridge/__init__.py`、app-server initialize `clientInfo`、
-  `openapi.yaml` metadata 一致（尚未打 git tag）。
+  `openapi.yaml` metadata 一致（已打 annotated tag `v1.0.0` 并发布 GitHub Release）。
 - README 重写为 V1 工程入口（What/Why/Architecture/Quick Start/Actions/Security/
   Configuration/Start-Stop/Project Structure/Known Limitations/V1 Status）。
 - 新增 `SECURITY.md`、`CHANGELOG.md`、`docs/zhihu-v1.md`（知乎初稿，未发布）。
+- 新增 `LICENSE`（BSD-3-Clause，`Copyright (c) 2026, Jiaqi Xin`，与其它自有仓库一致）。
+- 新增 launchd LaunchAgent 开机自启：plist 模板 + install/uninstall/status 脚本
+  （登录自动启动、幂等复用 `.runtime` PID、卸载不影响运行中进程）。
+
+### 发布后整理（2026-08-12）
+- 测试数字口径统一：离线单测 2/2（`test_config_propagation.py`）为当前可复现；
+  集成测试 2026-08-11 实测 core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6
+  为历史记录；当前 `test_http_api.py` 含 12 个唯一场景，与历史记录差 1 项，未复跑确认。
+- `docs/zhihu-v1.md` 编辑级重写（结构/文风/事实口径，状态更新为已发布）。
+- README 发布状态、测试口径与实测环境措辞更新。
 
 ### 安全与配置
 - `.gitignore` 强化：`.bridge_api_key`、`.public_url`、`.ngrok_domain`、`openapi.ngrok.yaml`、
@@ -40,7 +50,7 @@
 - `bridge/` core client：`codex app-server` 子进程生命周期、JSON-RPC 2.0 over stdio、
   通知分发、进程退出处理。
 - 7 个 HTTP action：start / continue / observe / steer / interrupt / list / read。
-- 集成测试 PASS（2026-08-11）：core 5 场景、actions 7 场景、HTTP API 12 场景。
+- 集成测试 PASS（2026-08-11，重建记录）：core 5/5、actions 7/7、HTTP API 11/11。
 
 ## [0.1.0] - 2026-08-11（重建）
 

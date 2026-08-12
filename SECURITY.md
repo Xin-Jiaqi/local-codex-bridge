@@ -30,4 +30,5 @@
 
 ## 报告
 
-- 项目尚未公开。公开后请通过 GitHub issues 报告安全问题；不要在 issue 中粘贴任何密钥。
+- 项目已公开（`Xin-Jiaqi/local-codex-bridge`）。请通过 GitHub issues 报告安全问题；
+  不要在 issue 中粘贴任何密钥。

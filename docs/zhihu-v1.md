@@ -1,140 +1,148 @@
-# Local Codex Bridge V1：让 ChatGPT Actions 直接驱动你本地的 Codex（DeepSeek 后端）
+# 把 ChatGPT 接到本地 Codex CLI：从复制命令到一句话直接操作本地项目
 
-> 状态：**初稿，未发布**。内容基于仓库当前真实代码与 2026-08-11/12 的本地测试记录撰写。
-> 版本：1.0.0（pre-release，未 git init / push / tag）。
+> 状态：已随 v1.0.0 发布（`Xin-Jiaqi/local-codex-bridge`，BSD-3-Clause）。
+> 本文基于 2026-08 的仓库代码、测试记录与真实开发历史整理。
 
-## TL;DR
+## 一、起点：复制粘贴循环
 
-一个零第三方依赖（Python 仅标准库）的本地 HTTP 桥：ChatGPT 通过 Custom GPT Actions 调用
-`https://<你的 ngrok 域名>/...`，桥在你自己的机器上维持一个持久的 `codex app-server` 进程
-（`model=deepseek-chat`、`model_provider=deepseek`），所有读写和命令都发生在**你的本地工作区**，
-模型 key 不出你的机器。
+用 Codex CLI 干活，默认流程是终端里一人一机：把任务敲进去，等输出，再手动搬运结果。
+这个循环在单机场景下成立，但把 ChatGPT 加进来之后，缺的东西变得具体：ChatGPT 需要一条
+稳定的通道去调用本地 Codex，一段提示词解决不了这个需求。这个项目就是这条通道：
+一个零第三方依赖（Python 标准库）的本地 HTTP 桥，把 Custom GPT Actions 接到常驻的
+`codex app-server` 上，模型走你自己的 DeepSeek 配置。
 
-## 为什么需要它
+![图片 1：自然语言实际效果——在 ChatGPT 里用一句话启动一个本地任务，任务在本地 workspace 执行并返回结果](images/placeholder-natural-language.png)
 
-Codex CLI 天生是终端里一个人用的。想让 ChatGPT 变成"远程操作员"，缺四层东西：
+## 二、常驻的 app-server
 
-1. **常驻 API**：每次开新会话的 CLI 不行，要一个一直活着的本地服务；
-2. **控制通道**：能操纵已运行 Codex 的 stdio JSON-RPC（`codex app-server`）；
-3. **会话连续性**：同一任务必须在同一个 native thread 上继续，而不是每次复制历史重来；
-4. **安全边界**：ChatGPT 只拿到有限的动作 + Bearer key，本地审批流不暴露给它。
-
-这个项目把四层都补齐了。
-
-## 架构
-
-![图片 1：整体架构图（ChatGPT → ngrok 隧道 → 本地 Bridge → codex app-server → DeepSeek）](images/placeholder-architecture.png)
-
-```
-ChatGPT (Custom GPT Actions)
-   │  HTTPS + Authorization: Bearer <key>，x-openai-isConsequential: false
-   ▼
-ngrok 固定域名（.ngrok_domain，gitignored）
-   │
-   ▼
-127.0.0.1:8321  BridgeHttpServer（http_server/，stdlib ThreadingHTTPServer）
-   │  JSON-RPC 2.0 over stdio
-   ▼
-codex app-server（一个持久进程，model=deepseek-chat）
-   │
-   ▼
-DeepSeek API（key 只在你的 CODEX_HOME / 环境变量里）
-   │
-   ▼
-本地工作区（sandbox_mode=workspace-write，approval_policy=never）
-```
-
-关键点：
-
-- 全链路只有一个 app-server 进程，`thread_id`/`turn_id` 是唯一会话句柄；
-- 模型后端、API key、工作区全在你机器上，公网只暴露一个带 key 的 HTTP 面；
-- `schemas/` 直接复用官方 app-server 协议 schema，不自己发明协议。
-
-## V1 能力
-
-| 能力 | 说明 |
-|---|---|
-| start / continue | 新建或继续 native thread，**不复制历史** |
-| observe | 事件驱动等待（最长 10s，不轮询） |
-| steer / interrupt | 排队注入指令 / 立即中断（Codex 0.147.0 语义） |
-| list / read | 线程列表 / 真实历史（摘要化返回） |
-| 安全 | 全端点 Bearer 认证（除 /health），常量时间比较 |
-| 运维 | 幂等启动、精确 PID 管理、健康检查、stop 隔离 |
-
-## 快速开始
-
-前置：`codex` CLI 在 PATH（实测 codex-cli 0.147.0）、DeepSeek provider 已配置、
-ngrok 已装且有固定域名、Python 3.8+。
+`codex app-server` 提供一个基于 stdio 的 JSON-RPC 协议（`codex app-server --listen stdio://`），
+一行一个 JSON 帧。Bridge 用 subprocess 拉起一个持久进程，完成 `initialize` 握手后保持连接：
 
 ```bash
-openssl rand -hex 32 > .bridge_api_key && chmod 600 .bridge_api_key
-echo 'your-name.ngrok-free.dev' > .ngrok_domain   # 或 export NGROK_DOMAIN=...
-./scripts/start_ngrok_bridge.sh                   # 后台启动，输出 READY
-curl -s http://127.0.0.1:8321/health
-curl -s https://your-name.ngrok-free.dev/health
-./scripts/stop_ngrok_bridge.sh                    # 只停本脚本启动的进程
+codex app-server --listen stdio:// \
+  -c 'model="deepseek-chat"' -c 'model_provider="deepseek"' \
+  -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"'
 ```
 
-然后把 `openapi.yaml`（模板）替换 URL 后粘贴进 Custom GPT → Actions，
-认证选 API Key：Header `Authorization`，Value `Bearer <key>`。
+协议 schema 直接复用官方 `schemas/`（v1/v2），不自己发明格式。`CODEX_HOME` 指向独立
+profile（默认 `~/.codex-deepseek`），DeepSeek provider 与 key 都在这个 profile 里，
+key 只存在于启动 bridge 的 shell 环境中，不写入任何项目文件。
 
-![图片 2：Custom GPT Actions 配置界面（粘贴 OpenAPI + Bearer 认证）](images/placeholder-actions-config.png)
+## 三、native thread：会话的唯一事实来源
 
-![图片 3：start_ngrok_bridge.sh 的 READY 启动输出](images/placeholder-ready-output.png)
+Codex 的会话模型以 thread / turn 为句柄。Bridge 的会话连续性依赖一条规则：`continue`
+永远在同一个 native thread 上开新 turn（先 `thread/read` 确认存在，再 `turn/start`），
+不复制历史、不重建上下文。Bridge 自己不维护会话表，thread 的完整历史存在 Codex 原生
+存储里，bridge 重启后依然可读。调用方只需要记住两个 id：`thread_id` 和 `turn_id`。
 
-## 安全模型：三个必须理解的权衡
+## 四、七个动作的抽象
 
-### 1. `sandbox_mode="workspace-write"`
+协议被收敛成 7 个动作：
 
-app-server 每次启动都显式传入（不依赖本机 config 文件）。含义：workspace 内的文件读写和命令
-**直接执行**；workspace 外的一切**自动拒绝**。
+- `start`：新建 native thread 并开始第一轮（可指定 cwd）
+- `continue`：同一 thread 继续，模型记得前文
+- `observe`：有界、事件驱动地等待 turn 结束
+- `steer`：向运行中的 turn 排队注入新指令
+- `interrupt`：中止运行中的 turn
+- `list`：列出 native threads（含 cwd / preview / status / updated_at）
+- `read`：读取 thread 的真实 turn 历史（摘要化返回）
 
-### 2. `approval_policy="never"`
+HTTP 层对应 8 个端点（`/health` 免认证 + 上述 7 个 action），错误统一为
+`{"error": {"type": ..., "message": ...}}`：400 参数错误、401 未认证、404 未知
+thread/turn、413 body 过大、502 app-server 错误。
 
-不会有任何审批弹窗——因为桥**不把审批请求转发给 ChatGPT**（需要权限提升的操作直接失败）。
-好处是 ChatGPT 无法诱导出"提权"操作；代价是工作区外（如系统目录、网络）一律不可用，
-没有升级通道。这是刻意的 V1 边界。
+![图片 2：整体架构图（ChatGPT → ngrok 隧道 → 本地 Bridge → codex app-server → DeepSeek）](images/placeholder-architecture.png)
 
-### 3. `x-openai-isConsequential: false`
+## 五、observe：事件驱动，不轮询
 
-每个 action 都声明为"非后果性"，ChatGPT 调用前不会弹确认。**这只是声明，不是保护**——
-真正的边界是前两条 + Bearer key。持有 key ≈ 获得 workspace 内的命令执行权；
-公网暴露时请严格控制 key 的分发与轮换。
+`observe` 订阅 `turn/completed` 通知，配合 `threading.Event` 做有界等待：turn 结束立刻
+返回，超时返回 `running`，由调用方决定下一步。没有忙轮询。GPT Actions 端有超时约束，
+单次 observe 上限 10s；长任务用 `start → observe → observe → … → continue` 的组合跑完，
+每轮 observe 拿一次增量结果。
 
-## 测试历史（真实记录）
+## 六、steer 与 interrupt：0.147.0 的真实语义
 
-- 2026-08-11 集成测试全 PASS：core 5/5、actions 7/7、HTTP API 12 场景、公网 tunnel 6/6；
-- 离线单元测试（`tests/test_config_propagation.py`，无需真实后端）：验证 app-server
-  spawn 参数包含 `approval_policy="never"` 与 `sandbox_mode="workspace-write"`，且
-  `CODEX_HOME` 正确透传到子进程环境；
-- 启动脚本本身带三层健康检查：本地 `/health` → 隧道上线 → 公网 `/health`。
+`turn/steer` 在 Codex 0.147.0 里是排队语义：指令注入当前正在运行的 turn，不打断生成，
+当前回复结束后才生效。steer 请求带 `expectedTurnId`，如果服务端返回了不同的 turn，
+bridge 直接报错，避免静默漂移。要立即转向，正确组合是 `interrupt` 中止当前 turn，
+再 `continue` 同一 thread 开新 turn。这套语义也写进了 `openapi.yaml` 的 steer 描述里，
+调用方和实现保持一致。
 
-![图片 4：集成测试 PASS 结果摘要（2026-08-11）](images/placeholder-test-results.png)
+## 七、HTTP / OpenAPI / Custom GPT
 
-## 已知限制
+Bridge 绑定 `127.0.0.1:8321`（stdlib `ThreadingHTTPServer`），`openapi.yaml`（3.1.0）
+是公开模板，`servers.url` 是占位符。使用流程：把模板里的 URL 替换成自己的 ngrok 域名，
+粘贴进 Custom GPT → Actions，认证方式选 API Key（Header `Authorization`，
+Value `Bearer <key>`）。部署副本（`openapi.ngrok.yaml`）含真实域名，gitignored，
+不随仓库发布。
 
-- 单常驻 app-server：无多租户/资源隔离；
-- 无内置限流、无失败锁定、无 IP 白名单（依赖隧道层补充）；
-- `steer` 是排队语义：不打断当前生成，需要立即转向请用 `interrupt` + `continue`；
-- 响应摘要截断 4000 字符；`/threads` 单页 ≤20；
-- 仅实测 macOS arm64 + codex 0.147.0；
-- 暂无 MCP layer（`bridge/` 接口预留了扩展空间）。
+![图片 3：Custom GPT Actions 配置界面（粘贴 OpenAPI schema + Bearer 认证）](images/placeholder-actions-config.png)
 
-## 后续计划
+## 八、隧道：从 Cloudflare 到 ngrok
 
-- git init + GitHub 仓库（可见性待定）与 LICENSE 选型；
-- 本机复跑三个集成测试并归档结果；
-- 隧道层访问控制/限流；
-- 根据反馈考虑 MCP layer。
+早期版本用 cloudflared quick tunnel 暴露公网（`start_public_bridge.sh`，v1.0.0 清理时
+移除）。quick tunnel 的问题在运维层：URL 每次重启都会变，免费档连接不稳定。期间遇到过
+一个典型的误判场景：本地 `/health` 正常、observe 按预期等待，公网请求却超时——第一反应
+像是 observe 的 bug，排查后确认是隧道断连（tunnel connectivity failure），本地观察
+逻辑本身没有问题。
 
-## 附录：仓库结构
+v1.0.0 换用 ngrok 固定域名：域名写进 `.ngrok_domain`（gitignored），启动脚本幂等拉起
+bridge 与 ngrok，并做三层健康检查——本地 `/health`、隧道上线（ngrok 本地 API）、公网
+`/health`。任何一层不过就报错退出，不留下"半活"状态。
 
-```
-bridge/        核心库（app-server 客户端 + BridgeCore）
-http_server/   HTTP API（stdlib，Bearer 认证）
-schemas/       codex app-server 协议 schema（v1/v2）
-scripts/       start/stop_ngrok_bridge.sh（幂等、PID 管理）
-tests/         3 个集成测试 + 1 个离线单测
-openapi.yaml   公开模板（占位 URL）
-docs/          知乎初稿等
-```
+## 九、认证与 consequential
+
+除 `/health` 外全部端点要求 `Authorization: Bearer <key>`，用 `hmac.compare_digest`
+做常量时间比较；key 是 256-bit 随机值（`openssl rand -hex 32`），只经环境变量注入进程。
+`x-openai-isConsequential: false` 的作用是让 ChatGPT 调用前不弹确认，它只是声明，
+安全边界由 key 认证与工作区沙箱构成。持有 key 相当于拿到 workspace 内的命令执行权，
+公网暴露时控制分发、定期轮换。
+
+## 十、approval 与 workspace-write
+
+app-server 固定以 `approval_policy="never"` + `sandbox_mode="workspace-write"` 启动，
+不依赖本机 config 文件。效果：workspace 内的文件读写与命令直接执行；workspace 外的
+一切自动拒绝。bridge 不转发 `requestApproval` 类请求（统一回 `-32601`），所以没有任何
+审批弹窗，也没有升级通道。代价是系统目录、网络等需要提权的操作一律不可用——这是刻意的
+V1 边界。如果把这两个 override 去掉，app-server 会回落到 config 里的审批策略（比如
+`untrusted`），每个命令都触发 `requestApproval`，bridge 只能回 `-32601`，表现为
+"approval request failed"。这也是 override 写死在代码里的原因。
+
+## 十一、生命周期与开机自启
+
+start / stop 脚本用 `.runtime/` 里的 PID 文件做精确管理：只杀自己启动的进程，端口或
+域名被未托管进程占用时直接报错、绝不动它；start 脚本幂等，重复执行会复用仍在运行的
+进程。LaunchAgent 把同一套脚本接到登录自启：plist 模板放在仓库里（占位符安装时替换成
+绝对路径，生成到 `~/Library/LaunchAgents/`），`RunAtLoad` 登录启动一次，`KeepAlive=false`
+不自动重启，`AbandonProcessGroup` 保证脚本退出后后台进程不被 launchd 回收。launchd 的
+PATH 很短，plist 注入常见 bin 目录，start 脚本也会自动在 `~/.local/bin`、
+`/opt/homebrew/bin`、`/usr/local/bin` 里找 `codex` 和 `ngrok`。
+
+![图片 4：start_ngrok_bridge.sh 的 READY 启动输出（三层健康检查通过）](images/placeholder-ready-output.png)
+
+## 十二、最终体验
+
+在 ChatGPT 里说一句话，比如"把当前仓库里所有 TODO 找出来，按文件整理成清单"：ChatGPT
+调 `/start` 建 thread，任务在本地 workspace 由 codex 执行，`observe` 拿结果；中途要改
+方向就 `steer`，要立刻停就 `interrupt`。全程模型 key、工作区、进程都在自己的机器上，
+公网只暴露一个带 key 的 HTTP 面。ChatGPT 拿到的只有 7 个动作和认证后的响应摘要，
+看不到本地文件系统，也不能绕开沙箱。
+
+## 十三、限制与适用人群
+
+- 单常驻 app-server，无多租户与资源隔离
+- 无内置限流、失败锁定、IP 白名单，长期公网使用需在隧道/网关层补充
+- `steer` 是排队语义，需要立即转向请用 `interrupt` + `continue`
+- 响应摘要截断 4000 字符；`/threads` 单页 ≤20
+- 仅实测 macOS arm64 + codex 0.147.0，其它平台与版本未验证
+- 暂无 MCP layer，`bridge/` 接口为后续扩展留了位置
+
+适用人群是个人开发者：把 ChatGPT 当"远程操作员"，在自己的机器上跑单机任务。
+多用户共用、需要审批流或审计的场景不适合当前形态。
+
+测试数字口径：离线单测 2/2（`test_config_propagation.py`，当前可复现）；集成测试
+2026-08-11 实测 core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6（历史记录）；
+当前 `test_http_api.py` 含 12 个场景，与历史记录差 1 项，未复跑确认。
+
+整个系统只有两条边界：本地一条 JSON-RPC 通道，公网一个带认证的 HTTP 面。会话连续性
+与安全边界写死在代码里，剩下的都是运维细节。

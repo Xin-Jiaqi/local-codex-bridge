@@ -1,0 +1,411 @@
+openapi: 3.1.0
+info:
+  title: Local Codex Bridge API
+  version: 1.0.0
+  description: |
+    Local HTTP bridge over the Codex app-server (DeepSeek backend) for
+    ChatGPT Custom GPT Actions.
+
+    Auth: all endpoints except /health require
+    `Authorization: Bearer <BRIDGE_API_KEY>` (same key in every request).
+
+    Steering semantics: Codex 0.147.0 turn/steer QUEUES the instruction into
+    the currently active turn. It does NOT immediately interrupt the current
+    generation. To change direction right away, call codexInterrupt, then
+    codexContinue on the same thread.
+
+    Responses are intentionally summarized (no raw Codex payloads).
+servers:
+  - url: https://REPLACE_WITH_PUBLIC_URL
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: codexHealth
+      x-openai-isConsequential: false
+      summary: Health check (no auth required)
+      security: []
+      responses:
+        "200":
+          description: Server and app-server alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  app_server_alive:
+                    type: boolean
+                  model:
+                    type: string
+                  model_provider:
+                    type: string
+        "503":
+          $ref: "#/components/responses/Error"
+  /start:
+    post:
+      operationId: codexStart
+      x-openai-isConsequential: false
+      summary: Create a native Codex thread and start the first turn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt:
+                  type: string
+                  description: First user message
+                cwd:
+                  type: string
+                  description: Working directory for the thread
+      responses:
+        "200":
+          description: Thread and turn started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread_id, turn_id, status]
+                properties:
+                  thread_id:
+                    type: string
+                  turn_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [started]
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          $ref: "#/components/responses/Error"
+  /continue:
+    post:
+      operationId: codexContinue
+      x-openai-isConsequential: false
+      summary: Start a new turn on the same native thread (no history copy)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [thread_id, prompt]
+              properties:
+                thread_id:
+                  type: string
+                prompt:
+                  type: string
+      responses:
+        "200":
+          description: Follow-up turn started on the same thread
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread_id, turn_id, status]
+                properties:
+                  thread_id:
+                    type: string
+                  turn_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [started]
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          $ref: "#/components/responses/Error"
+  /observe:
+    post:
+      operationId: codexObserve
+      x-openai-isConsequential: false
+      summary: Wait (bounded) for a turn and return its current status and assistant text
+      description: |
+        Returns as soon as the turn completes within wait_ms, otherwise
+        returns status "running". wait_ms is capped at 10000.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [thread_id, turn_id]
+              properties:
+                thread_id:
+                  type: string
+                turn_id:
+                  type: string
+                wait_ms:
+                  type: integer
+                  minimum: 0
+                  maximum: 10000
+                  default: 5000
+      responses:
+        "200":
+          description: Turn observation result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread_id, turn_id, status]
+                properties:
+                  thread_id:
+                    type: string
+                  turn_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [running, completed, interrupted, failed]
+                  assistant_text:
+                    type: string
+                  error:
+                    type: [string, "null"]
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+  /steer:
+    post:
+      operationId: codexSteer
+      x-openai-isConsequential: false
+      summary: Queue a steering instruction into the currently active turn
+      description: |
+        Codex 0.147.0 semantics: the steer input is queued and applied to the
+        SAME active turn AFTER the current model response finishes. It does not
+        interrupt the current generation. For immediate redirection use
+        codexInterrupt then codexContinue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [thread_id, turn_id, prompt]
+              properties:
+                thread_id:
+                  type: string
+                turn_id:
+                  type: string
+                prompt:
+                  type: string
+      responses:
+        "200":
+          description: Steer accepted on the same turn
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread_id, turn_id, status]
+                properties:
+                  thread_id:
+                    type: string
+                  turn_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [steer_accepted]
+                  note:
+                    type: string
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+  /interrupt:
+    post:
+      operationId: codexInterrupt
+      x-openai-isConsequential: false
+      summary: Abort a running turn and return its final status
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [thread_id, turn_id]
+              properties:
+                thread_id:
+                  type: string
+                turn_id:
+                  type: string
+      responses:
+        "200":
+          description: Turn final status after interrupt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread_id, turn_id, status]
+                properties:
+                  thread_id:
+                    type: string
+                  turn_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [interrupted, completed, failed]
+                  assistant_text:
+                    type: string
+                  error:
+                    type: [string, "null"]
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+  /threads:
+    get:
+      operationId: codexList
+      x-openai-isConsequential: false
+      summary: List native threads (no local database)
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of most recent threads to return (values above 20 are clamped to 20).
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 20
+      responses:
+        "200":
+          description: Thread list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [threads]
+                properties:
+                  threads:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ThreadSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          $ref: "#/components/responses/Error"
+  /threads/{thread_id}:
+    get:
+      operationId: codexRead
+      x-openai-isConsequential: false
+      summary: Read one native thread with summarized turn history
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thread with turn history (summarized)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thread_id]
+                properties:
+                  thread_id:
+                    type: string
+                  cwd:
+                    type: [string, "null"]
+                  preview:
+                    type: [string, "null"]
+                  status:
+                    type: [string, "null"]
+                  updated_at:
+                    type: [integer, "null"]
+                  turns:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        turn_id:
+                          type: string
+                        status:
+                          type: [string, "null"]
+                        started_at:
+                          type: [integer, "null"]
+                        assistant_text:
+                          type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ThreadSummary:
+      type: object
+      required: [thread_id]
+      properties:
+        thread_id:
+          type: string
+        cwd:
+          type: [string, "null"]
+        preview:
+          type: [string, "null"]
+        title:
+          type: [string, "null"]
+        status:
+          type: [string, "null"]
+        updated_at:
+          type: [integer, "null"]
+        created_at:
+          type: [integer, "null"]
+        model_provider:
+          type: [string, "null"]
+  responses:
+    Unauthorized:
+      description: Missing or invalid Bearer API key
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type:
+                    type: string
+                  message:
+                    type: string
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type:
+                    type: string
+                  message:
+                    type: string

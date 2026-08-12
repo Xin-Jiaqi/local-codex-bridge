@@ -1,0 +1,18 @@
+# secrets — never commit
+.bridge_api_key
+.public_url
+.ngrok_domain
+openapi.ngrok.yaml
+
+# runtime pid/log files created by scripts/start_ngrok_bridge.sh
+.runtime/
+*.pid
+*.log
+turn_completed.json
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

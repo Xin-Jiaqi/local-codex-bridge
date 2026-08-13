@@ -8,11 +8,13 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/bash</string>
-		<string>__PROJECT_ROOT__/scripts/start_ngrok_bridge.sh</string>
+		<string>__DATA_ROOT__/current/scripts/run_local_supervisor.sh</string>
+		<string>--instance</string>
+		<string>local</string>
 	</array>
 
 	<key>WorkingDirectory</key>
-	<string>__PROJECT_ROOT__</string>
+	<string>__DATA_ROOT__/current</string>
 
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -20,16 +22,22 @@
 		<string>__HOME__</string>
 		<key>PATH</key>
 		<string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-		<!--__ENVIRONMENT_EXTRA__-->
 	</dict>
 
 	<key>RunAtLoad</key>
 	<true/>
-	<key>KeepAlive</key>
-	<false/>
 
-	<key>AbandonProcessGroup</key>
-	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>__STATE_RUNTIME__/supervisor.enabled</key>
+			<true/>
+		</dict>
+	</dict>
+
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
 
 	<key>ProcessType</key>
 	<string>Background</string>

@@ -35,9 +35,9 @@ CONFIG_OVERRIDES = [
     'model="deepseek-chat"',
     'model_reasoning_effort="max"',
     'model_provider="deepseek"',
-    # V1 security boundary: no approval prompts for workspace-local work;
-    # anything outside the workspace is auto-denied.
-    'approval_policy="never"',
+    # Workspace-local work runs without prompts; out-of-boundary operations
+    # raise requestApproval (answered by the bridge client).
+    'approval_policy="on-request"',
     'sandbox_mode="workspace-write"',
 ]
 

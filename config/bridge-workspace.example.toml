@@ -1,0 +1,47 @@
+# bridge-workspace permission profile — reference / file-based alternative.
+#
+# The Bridge injects EXACTLY these rules at runtime via `codex app-server -c`
+# dotted TOML overrides (http_server/server.py: BRIDGE_WORKSPACE_*_OVERRIDE),
+# so BRIDGE_SANDBOX_MODE=bridge-workspace needs no change to
+# $CODEX_HOME/config.toml except ONE: the config must NOT contain legacy
+# `sandbox_mode` or `[sandbox_workspace_write]` keys. Beta permission profiles
+# cannot be mixed with the legacy sandbox mechanism — any loaded legacy key
+# makes Codex use the legacy sandbox and ignore `default_permissions`. Run
+# scripts/migrate_codex_home_permissions.py (dry-run/verify first) for the
+# dedicated CODEX_HOME; the migration writes this profile block and preserves
+# everything else.
+#
+# Scope: baseline protections from the built-in `:workspace` profile
+# (extends), workspace-local writes incl. `.git/` metadata (hooks kept
+# read-only), `.env` kept read-only, GitHub-only network allowlist. No
+# full-disk access, no arbitrary network. No secrets belong here; only
+# policy rules.
+
+[permissions.bridge-workspace]
+description = "Bridge minimal grant: workspace writes incl. .git/ metadata + GitHub-only network, no full disk access"
+extends = ":workspace"
+
+[permissions.bridge-workspace.filesystem]
+":minimal" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+
+[permissions.bridge-workspace.filesystem.":workspace_roots"]
+"." = "write"
+".git/" = "write"
+".git/hooks/" = "read"
+".codex/" = "read"
+".agents/" = "read"
+".env" = "read"
+
+[permissions.bridge-workspace.network]
+enabled = true
+
+[permissions.bridge-workspace.network.domains]
+"github.com" = "allow"
+"*.github.com" = "allow"
+"api.github.com" = "allow"
+"ssh.github.com" = "allow"
+"*.githubusercontent.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+"raw.githubusercontent.com" = "allow"

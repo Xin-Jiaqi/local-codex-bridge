@@ -14,6 +14,11 @@ import threading
 import time
 
 from .client import AppServerError
+from .workspace_guard import (
+    TaskCwdError,
+    validate_maintenance_cwd,
+    validate_task_cwd,
+)
 
 MODEL = "deepseek-chat"
 MODEL_PROVIDER = "deepseek"
@@ -187,11 +192,14 @@ class _TurnTracker:
 class BridgeCore:
     """High-level bridge API. Holds one app-server connection."""
 
-    def __init__(self, client, model=MODEL, model_provider=MODEL_PROVIDER, max_summary_chars=500):
+    def __init__(self, client, model=MODEL, model_provider=MODEL_PROVIDER,
+                 max_summary_chars=500, thread_config=None, cwd_guard=None):
         self.client = client
         self.model = model
         self.model_provider = model_provider
         self.max_summary_chars = max_summary_chars
+        self._thread_config = dict(thread_config) if thread_config else None
+        self._cwd_guard = dict(cwd_guard) if cwd_guard else None
         self.tracker = _TurnTracker()
         client.on("*", self.tracker.on_notification)
 
@@ -200,9 +208,30 @@ class BridgeCore:
     def start(self, prompt, cwd=None):
         """Create a native Codex thread and start the first turn.
 
+        When a cwd guard is configured (always, in the HTTP bridge), the cwd
+        is canonicalized and validated against the bridge control plane
+        BEFORE thread/start is sent; a rejected cwd raises TaskCwdError and
+        no app-server request is made. The validator is selected by the
+        guard's ``scope``: ``maintenance`` (host-admin window) accepts only
+        the Bridge repo itself or a real subdirectory; local/hpc use the
+        task guard unchanged.
+
         Returns (thread_id, turn_id).
         """
+        if self._cwd_guard:
+            guard = dict(self._cwd_guard)
+            scope = guard.pop("scope", None)
+            if scope == "maintenance":
+                cwd = validate_maintenance_cwd(cwd, **guard)
+            else:
+                cwd = validate_task_cwd(cwd, **guard)
         params = {"cwd": cwd, "model": self.model, "modelProvider": self.model_provider}
+        if self._thread_config:
+            # Codex 0.147.0: named permission profiles are selected per-thread
+            # via config.default_permissions. The legacy `sandbox` field must
+            # stay absent: its enum cannot express a profile, and sending it
+            # would force the legacy sandbox and disable the profile.
+            params["config"] = dict(self._thread_config)
         res = self.client.request("thread/start", params, timeout=60)
         thread = res.get("thread") or {}
         thread_id = thread.get("id")
@@ -220,6 +249,10 @@ class BridgeCore:
 
         Never creates a new thread and never copies history.
         Returns the new turn_id.
+
+        No permission context is re-sent: the thread already carries the
+        profile selected at thread/start (ThreadResumeParams would accept the
+        same `config`, but the bridge never resumes threads).
         """
         state = self.client.request("thread/read", {"threadId": thread_id, "includeTurns": False}, timeout=30)
         thread = state.get("thread") or {}
@@ -358,6 +391,9 @@ class BridgeCore:
     # ------------------------------------------------------------------ internals
 
     def _start_turn(self, thread_id, prompt):
+        # turn/start must never carry `sandboxPolicy`: the schema has no
+        # named-profile variant, and sending it would override the thread's
+        # permission profile with a legacy policy.
         res = self.client.request(
             "turn/start",
             {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},

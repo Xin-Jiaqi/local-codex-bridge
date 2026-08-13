@@ -3,7 +3,7 @@
 
 Never spawns a real Codex app-server. Verifies:
 
-1. http_server CONFIG_OVERRIDES enforce `approval_policy="never"` and
+1. http_server CONFIG_OVERRIDES enforce `approval_policy="on-request"` and
    `sandbox_mode="workspace-write"` (the V1 security boundary: workspace-local
    read/write/shell run without prompts; anything outside the workspace is
    auto-denied).
@@ -24,7 +24,7 @@ if ROOT not in sys.path:
 
 import bridge.client as client_module
 from bridge import CodexAppServerClient, Logger
-from http_server.server import CONFIG_OVERRIDES
+from http_server.server import CONFIG_OVERRIDES, build_config_overrides
 
 
 class _FakeStdin(io.StringIO):
@@ -78,10 +78,21 @@ class _FakeProc:
 class StartupConfigTest(unittest.TestCase):
 
     def test_server_overrides_enforce_v1_policy(self):
-        self.assertIn('approval_policy="never"', CONFIG_OVERRIDES)
+        self.assertIn('approval_policy="on-request"', CONFIG_OVERRIDES)
         self.assertIn('sandbox_mode="workspace-write"', CONFIG_OVERRIDES)
-        self.assertEqual(CONFIG_OVERRIDES.count('approval_policy="never"'), 1)
+        self.assertEqual(CONFIG_OVERRIDES.count('approval_policy="on-request"'), 1)
         self.assertEqual(CONFIG_OVERRIDES.count('sandbox_mode="workspace-write"'), 1)
+
+    def test_approval_policy_env_override_from_instance_config(self):
+        overrides = build_config_overrides({"BRIDGE_APPROVAL_POLICY": "never"})
+        self.assertIn('approval_policy="never"', overrides)
+        self.assertEqual(
+            overrides.count('approval_policy="never"'), 1,
+        )
+        # default stays on-request; invalid values fail loudly
+        self.assertIn('approval_policy="on-request"', build_config_overrides({}))
+        with self.assertRaises(ValueError):
+            build_config_overrides({"BRIDGE_APPROVAL_POLICY": "always"})
 
     def test_client_passes_overrides_to_app_server_spawn(self):
         calls = {}
@@ -90,7 +101,7 @@ class StartupConfigTest(unittest.TestCase):
             calls["args"] = list(args)
             calls["env"] = dict(kwargs.get("env") or os.environ)
             return _FakeProc({
-                "userAgent": "local-codex-bridge-core/1.0.0 (offline test)",
+                "userAgent": "local-codex-bridge-core/1.1.0 (offline test)",
                 "codexHome": "/offline/codex-home",
             })
 

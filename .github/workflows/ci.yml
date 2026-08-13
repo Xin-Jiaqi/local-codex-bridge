@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: offline tests + static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5.5.0
+        with:
+          python-version: "3.12"
+      - name: Offline unit tests (no app-server, no DeepSeek, no network, no secrets)
+        run: |
+          set -e
+          for t in \
+            tests/test_config_propagation.py \
+            tests/test_sandbox_mode.py \
+            tests/test_instance_isolation.py \
+            tests/test_workspace_guard.py \
+            tests/test_maintenance_instance.py \
+            tests/test_git_automation.py \
+            tests/test_migrate_codex_home_permissions.py \
+            tests/test_pid_guard.py \
+            tests/test_runtime_supervisor.py \
+            tests/test_activate_runtime_autorecovery.py; do
+            python3 "$t"
+          done
+      - name: py_compile
+        run: |
+          set -e
+          python3 -m py_compile \
+            http_server/server.py \
+            bridge/__init__.py bridge/client.py bridge/core.py \
+            scripts/migrate_codex_home_permissions.py \
+            tests/test_*.py
+      - name: Shell syntax (bash -n)
+        run: |
+          set -e
+          for f in scripts/*.sh; do bash -n "$f"; done
+      - name: Plist lint (stdlib plistlib, cross-platform)
+        run: |
+          python3 -c "import glob,plistlib; [plistlib.load(open(f,'rb')) for f in glob.glob('scripts/launch_agent/*.plist')]"
+
+  plist-macos:
+    name: macOS plutil lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: plutil -lint
+        run: plutil -lint scripts/launch_agent/*.plist

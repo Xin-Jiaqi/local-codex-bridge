@@ -2,6 +2,7 @@
 .bridge_api_key
 .public_url
 .ngrok_domain
+.bridge_sandbox_mode
 openapi.ngrok.yaml
 
 # runtime pid/log files created by scripts/start_ngrok_bridge.sh
@@ -9,6 +10,13 @@ openapi.ngrok.yaml
 *.pid
 *.log
 turn_completed.json
+
+# tool-generated timestamped backups (ignored, never committed; files stay on disk)
+*.bak-*
+.bridge_sandbox_mode.bak-*
+
+# external maintenance artifacts (other repo deliverables) — never commit
+deliverables/
 
 # python
 __pycache__/

@@ -132,9 +132,9 @@ def validate_openapi():
     if limit_schema != {"type": "integer", "default": 10, "minimum": 1, "maximum": 20}:
         ok = False
         problems.append("/threads limit param schema wrong: %r" % limit_schema)
-    if spec.get("info", {}).get("version") != "1.0.0":
+    if spec.get("info", {}).get("version") != "1.1.0":
         ok = False
-        problems.append("info.version != 1.0.0")
+        problems.append("info.version != 1.1.0")
     # Deployment copies (openapi.ngrok.yaml / openapi.public.yaml) are
     # optional and gitignored: they exist only on machines that generated
     # them with a real tunnel URL. The tracked template is openapi.yaml.

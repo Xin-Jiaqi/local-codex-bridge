@@ -60,10 +60,12 @@ class CodexAppServerClient:
     # far too noisy to print one line per token delta.
     QUIET_NOTIFICATIONS = frozenset({"item/reasoning/textDelta", "item/agentMessage/delta"})
 
-    def __init__(self, codex_bin, codex_home, config_overrides=None, logger=None):
+    def __init__(self, codex_bin, codex_home, config_overrides=None,
+                 child_env=None, logger=None):
         self.codex_bin = os.path.abspath(os.path.expanduser(codex_bin))
         self.codex_home = os.path.abspath(os.path.expanduser(codex_home))
         self.config_overrides = list(config_overrides or [])
+        self.child_env = dict(child_env) if child_env is not None else None
         self.log = logger or Logger()
         self._proc = None
         self._reader = None
@@ -85,7 +87,7 @@ class CodexAppServerClient:
         """Spawn app-server and complete `initialize`."""
         if self._proc is not None:
             raise AppServerError("client already started")
-        env = dict(os.environ)
+        env = dict(self.child_env if self.child_env is not None else os.environ)
         env["CODEX_HOME"] = self.codex_home
         args = [self.codex_bin, "app-server", "--listen", "stdio://"]
         for kv in self.config_overrides:
@@ -110,7 +112,7 @@ class CodexAppServerClient:
         try:
             res = self.request(
                 "initialize",
-                {"clientInfo": {"name": "local-codex-bridge-core", "version": "1.0.0"}},
+                {"clientInfo": {"name": "local-codex-bridge-core", "version": "1.1.0"}},
                 timeout=timeout,
             )
             self.log.info(

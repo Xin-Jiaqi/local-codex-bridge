@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Local Codex Bridge API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Local HTTP bridge over the Codex app-server (DeepSeek backend) for
     ChatGPT Custom GPT Actions.
@@ -43,6 +43,15 @@ paths:
                     type: string
                   model_provider:
                     type: string
+                  instance:
+                    type: [string, "null"]
+                    description: Pinned instance (local, hpc, maintenance) or null for the legacy singleton
+                  mode:
+                    type: [string, "null"]
+                    description: Effective sandbox mode (e.g. bridge-workspace) or null for the legacy singleton
+                  port:
+                    type: integer
+                    description: HTTP port the bridge is actually listening on
         "503":
           $ref: "#/components/responses/Error"
   /start:

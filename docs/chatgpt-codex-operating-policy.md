@@ -69,6 +69,17 @@ f. ChatGPT 无法在回复结束后主动唤醒自己，也不能主动给用户
 - 只有遇到明确的 host-admin / approval blocker 时，才把最小操作交给用户；
   不绕过权限边界。
 
+## Human-free first
+
+- 在要求用户手工进入 Terminal 前，ChatGPT 必须先让 Codex 实际执行，并取得
+  明确的结构性 blocker 证据（sandbox/approval 拒绝、seatbelt 继承限制、
+  缺失的 host 权限）；能自动完成的继续自动完成。
+- 确实需要 host bootstrap 时，必须聚合为**一次幂等动作**（例如
+  `scripts/bootstrap_autorecovery.command`），不能连续让用户跑多条命令；
+  同类权限一旦 bootstrap 完成，后续不得再次要求用户手工操作。
+- 优先提供一键 / 双击入口而不是多条终端命令；用户只做最小一次性宿主操作，
+  之后由 Codex 自动接手并完成剩余步骤。
+
 ## Priority
 
 用户当次明确要求 > Custom GPT Instructions > 本 policy 仓库副本 > 一般默认。

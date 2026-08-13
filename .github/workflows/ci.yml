@@ -27,7 +27,8 @@ jobs:
             tests/test_migrate_codex_home_permissions.py \
             tests/test_pid_guard.py \
             tests/test_runtime_supervisor.py \
-            tests/test_activate_runtime_autorecovery.py; do
+            tests/test_activate_runtime_autorecovery.py \
+            tests/test_bootstrap_autorecovery_command.py; do
             python3 "$t"
           done
       - name: py_compile
@@ -42,6 +43,7 @@ jobs:
         run: |
           set -e
           for f in scripts/*.sh; do bash -n "$f"; done
+          bash -n scripts/bootstrap_autorecovery.command
       - name: Plist lint (stdlib plistlib, cross-platform)
         run: |
           python3 -c "import glob,plistlib; [plistlib.load(open(f,'rb')) for f in glob.glob('scripts/launch_agent/*.plist')]"

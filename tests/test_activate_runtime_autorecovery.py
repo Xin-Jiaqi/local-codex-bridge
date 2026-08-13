@@ -130,8 +130,8 @@ def install_fakes(repo, call_log):
         fh.write('#!/usr/bin/env bash\n'
                  'pid="$2"\n'
                  'case "$pid" in\n'
-                 '  8*) printf "bash %s/current/scripts/run_local_supervisor.sh --instance local\\n" "${BRIDGE_STATE_ROOT:?}" ;;\n'
-                 '  9*) printf "python3 -m http_server --host 127.0.0.1 --port 8321 --log %s/local/runtime/bridge.log\\n" "${BRIDGE_STATE_ROOT:?}" ;;\n'
+                 '  80001) printf "bash %s/current/scripts/run_local_supervisor.sh --instance local\\n" "${BRIDGE_STATE_ROOT:?}" ;;\n'
+                 '  90002|90003) printf "python3 -m http_server --host 127.0.0.1 --port 8321 --log %s/local/runtime/bridge.log\\n" "${BRIDGE_STATE_ROOT:?}" ;;\n'
                  '  *) printf "sleep 5\\n" ;;\n'
                  'esac\n')
     with open(os.path.join(repo, "scripts", "start_ngrok_bridge.sh"), "w") as fh:

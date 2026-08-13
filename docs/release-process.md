@@ -18,12 +18,13 @@
    tests/test_instance_isolation.py tests/test_workspace_guard.py
    tests/test_maintenance_instance.py tests/test_git_automation.py
    tests/test_migrate_codex_home_permissions.py tests/test_pid_guard.py
-   tests/test_runtime_supervisor.py tests/test_activate_runtime_autorecovery.py`
-   全绿（CI 跑同一 10 文件集合，共 212 项；runtime supervisor 的 11 项 live
+   tests/test_runtime_supervisor.py tests/test_activate_runtime_autorecovery.py
+   tests/test_bootstrap_autorecovery_command.py`
+   全绿（CI 跑同一 11 文件集合；runtime supervisor 的 11 项 live
    测试与 pid guard 的 3 项 live 测试需要 `ps`，CI/普通终端可跑，无 `ps` 的
    seatbelt 沙箱内跳过；git automation 的 1 项可选 sandbox 集成需要
-   `RUN_SANDBOX_TESTS=1` 在普通终端跑。2026-08-13 沙箱实测口径：212 项 =
-   197 passed / 15 skipped，逐文件结果见 `docs/release-validation-v1.1.0.md`）。
+   `RUN_SANDBOX_TESTS=1` 在普通终端跑。2026-08-13 沙箱实测口径：223 项 =
+   208 passed / 15 skipped，逐文件结果见 `docs/release-validation-v1.1.0.md`）。
 5. **静态检查**：`bash -n scripts/*.sh`、`py_compile`、`plutil -lint`、`git diff --check`。
 6. **secret/privacy scan**（不输出命中值）：扫真实 ngrok 域名（对比
    `.ngrok_domain` 内容）、`/Users/` 个人路径、`sk-`/`ghp_`/`Bearer` token 模式、

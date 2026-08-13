@@ -4,7 +4,7 @@
 > Host runtime activation **仍未在实机执行**（见文末），本文档不声称
 > launchd live verified。
 
-## 1. Safe offline suite（10 文件，可复现命令）
+## 1. Safe offline suite（11 文件，可复现命令）
 
 ```bash
 for t in \
@@ -17,13 +17,14 @@ for t in \
   tests/test_migrate_codex_home_permissions.py \
   tests/test_pid_guard.py \
   tests/test_runtime_supervisor.py \
-  tests/test_activate_runtime_autorecovery.py; do
+  tests/test_activate_runtime_autorecovery.py \
+  tests/test_bootstrap_autorecovery_command.py; do
   python3 "$t"
 done
 ```
 
 同一命令集合即 `.github/workflows/ci.yml` 的 offline 步骤与
-`docs/release-process.md` checklist 第 4 项；两个文件清单已对齐（10 文件）。
+`docs/release-process.md` checklist 第 4 项；两个文件清单已对齐（11 文件）。
 
 ### 结果（2026-08-13，seatbelt 沙箱实测；全部文件 `unittest` OK、退出码 0）
 
@@ -39,7 +40,8 @@ done
 | test_pid_guard.py | 10 | 3 | 7 |
 | test_runtime_supervisor.py | 35 | 11 | 24 |
 | test_activate_runtime_autorecovery.py | 11 | 0 | 11 |
-| **合计** | **212** | **15** | **197** |
+| test_bootstrap_autorecovery_command.py | 11 | 0 | 11 |
+| **合计** | **223** | **15** | **208** |
 
 ### 跳过分类（15 项，均不计入通过）
 
@@ -54,7 +56,7 @@ done
 
 | 检查 | 命令（可复现） | 结果 |
 |---|---|---|
-| shell 语法 | `for f in scripts/*.sh; do bash -n "$f"; done` | 18 个脚本全绿 |
+| shell 语法 | `for f in scripts/*.sh; do bash -n "$f"; done` + `bash -n scripts/bootstrap_autorecovery.command` | 18 个脚本 + `.command` 全绿 |
 | python 编译 | `PYTHONPYCACHEPREFIX=<tmp> python3 -m py_compile http_server/server.py bridge/*.py scripts/migrate_codex_home_permissions.py tests/test_*.py` | 全绿（临时 pyc 落 /tmp） |
 | plist lint | `plutil -lint scripts/launch_agent/*.plist` | 2 个 plist 全绿 |
 | OpenAPI | `info.version=1.1.0`；8 个 operation；全部 `x-openai-isConsequential: false` | 全绿 |
@@ -67,7 +69,7 @@ done
 - 未在真实主机执行 `./scripts/activate_runtime_autorecovery.sh`；
 - 未完成：runtime 安装、per-instance LaunchAgent 装载、supervisor 实机运行、
   bridge crash-recovery 实机自测、公网 /health 验证；
-- 因此 release notes / 本文档口径 = 「实现 + 离线测试已通过（212 = 197 + 15），
+- 因此 release notes / 本文档口径 = 「实现 + 离线测试已通过（223 = 208 + 15），
   实机装载待 host-admin」；不声称 launchd live verified。
 - 实机执行前置条件：maintenance window ACTIVE（`activate_maintenance_instance.sh`
   成功且 local+public /health = maintenance/bridge-workspace/8323），普通 Terminal

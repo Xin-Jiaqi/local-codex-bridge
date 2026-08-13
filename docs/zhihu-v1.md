@@ -18,7 +18,7 @@
 
 具体到我的用法，现在常发生的是这样：我在手机上说一句，把当前仓库的 TODO 按文件整理成清单，GPT 调 /start 在本地建一个 thread 跑起来，observe 等结果，拿到清单后问我下一步。中途我想改方向，就补一句，它调 steer 把新指令排进当前这轮之后；想停，interrupt 立刻打断。整个过程我不在电脑前，对话记录留在手机里，随时能翻。
 
-手机这个界面的价值在于，它是为我服务的对话层。GPT 会把结果整理成人话，把失败原因讲清楚，把下一步的选择列出来。Codex 在本地做的那些原始输出，不用我逐个看。需要图的时候，GPT 在对话里生成示意图，或者把数据画成图，配着解释一起给我。v1.1.0 里开机自动拉起 Bridge 的 runtime、supervisor 和 launchd 代理已经写完，212 项离线测试全绿（197 通过、15 跳过）；host activation 还没在实机完成，现阶段 Mac 登录后还是要手动开。旧版 Desktop 代理有 TCC 权限问题，运行时迁出 Desktop 正是这次改动的一部分。
+手机这个界面的价值在于，它是为我服务的对话层。GPT 会把结果整理成人话，把失败原因讲清楚，把下一步的选择列出来。Codex 在本地做的那些原始输出，不用我逐个看。需要图的时候，GPT 在对话里生成示意图，或者把数据画成图，配着解释一起给我。v1.1.0 里开机自动拉起 Bridge 的 runtime、supervisor 和 launchd 代理已经写完，223 项离线测试全绿（208 通过、15 跳过）；host activation 还没在实机完成，现阶段 Mac 登录后还是要手动开。旧版 Desktop 代理有 TCC 权限问题，运行时迁出 Desktop 正是这次改动的一部分。
 
 在外面用手机交代任务，对我来说是常态。语音输入的体验比打字顺，思路讲一半可以随时打断补充；iPhone 上的对话是我唯一要盯的界面，结果、失败原因、下一步选择都在那里。任务粒度也从一次改一个文件，慢慢变成一连串：整理清单、改代码、跑测试、写总结，中间没有需要我插手的环节。这套东西解决的是人在外面、活在家里的时差，任务不用等我到家才开工，我也不用为一次小改动专门坐到电脑前。
 
@@ -83,7 +83,7 @@ client 的实现有两处容易出事的细节：请求按 id 和响应配对，
 
 CODEX_HOME 指向独立 profile（默认 ~/.codex-deepseek），DeepSeek provider 和 key 都在这个 profile 里，和日常终端的配置互不干扰；DEEPSEEK_API_KEY 只存在于启动 bridge 的 shell 环境。
 
-生命周期由 bash 脚本管：start、stop、status 三个入口，运行时的 PID 和锁放在 .runtime 目录，stop 只停自己启动的进程，复用 PID 前先做只读校验，校验失败只报告 stale 进程，绝不 kill。开机自启的 launchd per-instance 代理、前台 supervisor 和 pause marker 都在 v1.1.0 里写好，212 项离线测试全绿（197 通过、15 跳过）；真实装载属于 host-admin 的一次性动作，还没在实机完成。开发中实测过一条运维规则：不要从 Bridge 沙箱内部发起重启，沙箱内拉起的任何进程都会继承 seatbelt profile，连 launchctl kickstart 拉起的 job 也一样；切换沙箱模式要在普通终端里 stop 再 start。
+生命周期由 bash 脚本管：start、stop、status 三个入口，运行时的 PID 和锁放在 .runtime 目录，stop 只停自己启动的进程，复用 PID 前先做只读校验，校验失败只报告 stale 进程，绝不 kill。开机自启的 launchd per-instance 代理、前台 supervisor 和 pause marker 都在 v1.1.0 里写好，223 项离线测试全绿（208 通过、15 跳过）；真实装载属于 host-admin 的一次性动作，还没在实机完成。开发中实测过一条运维规则：不要从 Bridge 沙箱内部发起重启，沙箱内拉起的任何进程都会继承 seatbelt profile，连 launchctl kickstart 拉起的 job 也一样；切换沙箱模式要在普通终端里 stop 再 start。
 
 会话模型以 thread 和 turn 为句柄，thread_id 和 turn_id 是调用方唯一需要记住的两个值。continue 永远在同一个 native thread 上开新 turn，不复制历史、不重建上下文，这是模型记得前文的实现基础。thread/start 的参数固定，模型和 provider 不接受调用方覆盖，ChatGPT 不能把任务指到别的模型上。V1 没有做 MCP layer，当时的诉求就是把动作暴露成 HTTP，少一层就少一个调试环节。
 
@@ -147,9 +147,9 @@ hpc 的组合（workspace-write 加 on-request 加网络开启）写死在模板
 
 这两处都是替身测试覆盖不到真实运行时接线的典型。所以这次补的回归测试专走真实路径：真实的 BridgeHttpServer 构造，真实的启动脚本环境传播。
 
-两处修复都合进当前工作区之后，再跑一遍完整离线测试，口径就是下一节写的 197 passed、15 skipped；实机上 local 和 maintenance 的 health 也重新验证过。
+两处修复都合进当前工作区之后，再跑一遍完整离线测试，口径就是下一节写的 208 passed、15 skipped；实机上 local 和 maintenance 的 health 也重新验证过。
 
-**测试口径。** 当前工作区可复现的测试口径是 197 passed、15 skipped，这 15 项不计入通过。15 项 skipped 里，3 项是 pid guard 的 live-process 测试，需要 ps，在无 ps 的沙箱里跳过；11 项是 runtime supervisor 的 live 测试（含 pause-resume 与 runtime-copy 运行），同样需要 ps 做 PID identity 验证，沙箱里跳过、CI 和普通终端能跑；1 项是 git automation 的可选 sandbox 集成，需要 RUN_SANDBOX_TESTS=1 在普通终端跑。离线测试总数 212 项，分布是：instance isolation 41 项、maintenance 40 项、git automation 29 项、runtime supervisor 35 项、workspace guard 19 项、migrate codex home 17 项、pid guard 10 项、sandbox mode 7 项、config propagation 3 项、activation autorecovery 11 项。这 197 项在当前环境直接跑通；另外 14 项（11 项 supervisor live、3 项 pid-guard live）需要普通终端里可用的 ps 做 PID identity 验证，1 项需要普通终端加 RUN_SANDBOX_TESTS=1 跑。
+**测试口径。** 当前工作区可复现的测试口径是 208 passed、15 skipped，这 15 项不计入通过。15 项 skipped 里，3 项是 pid guard 的 live-process 测试，需要 ps，在无 ps 的沙箱里跳过；11 项是 runtime supervisor 的 live 测试（含 pause-resume 与 runtime-copy 运行），同样需要 ps 做 PID identity 验证，沙箱里跳过、CI 和普通终端能跑；1 项是 git automation 的可选 sandbox 集成，需要 RUN_SANDBOX_TESTS=1 在普通终端跑。离线测试总数 223 项，分布是：instance isolation 41 项、maintenance 40 项、git automation 29 项、runtime supervisor 35 项、workspace guard 19 项、migrate codex home 17 项、pid guard 10 项、sandbox mode 7 项、config propagation 3 项、activation autorecovery 11 项、bootstrap autorecovery 11 项。这 208 项在当前环境直接跑通；另外 14 项（11 项 supervisor live、3 项 pid-guard live）需要普通终端里可用的 ps 做 PID identity 验证，1 项需要普通终端加 RUN_SANDBOX_TESTS=1 跑。
 
 集成测试需要真实 app-server 和 DeepSeek key，不进 CI。2026-08-11 的完整手动实测记录是 core 5/5、actions 7/7、HTTP API 11/11。当前 test_http_api.py 里有 12 个唯一场景，比历史记录多 1 项，新增的那项没有复跑确认。
 

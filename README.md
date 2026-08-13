@@ -490,7 +490,7 @@ plist 不含 secret/domain。**本次 maintenance 会话只完成实现与 temp-
   BSD-3-Clause；tag `v1.0.0` 指向 `fa82e91`，**不移动**）。v1.0.0 发布版只有
   `workspace-write`（V1 边界）一个沙箱模式，没有实例 / cwd 守卫 / 多实例
   LaunchAgent。
-- 离线单测（当前可复现，无需 app-server，共 **212 项**，其中 197 项当前环境直接跑通）：
+- 离线单测（当前可复现，无需 app-server，共 **223 项**，其中 208 项当前环境直接跑通）：
   `tests/test_config_propagation.py`（3）、`tests/test_sandbox_mode.py`（7）、
   `tests/test_instance_isolation.py`（41）、`tests/test_workspace_guard.py`（19）、
   `tests/test_maintenance_instance.py`（40）、`tests/test_runtime_supervisor.py`（35：
@@ -498,7 +498,8 @@ plist 不含 secret/domain。**本次 maintenance 会话只完成实现与 temp-
   `tests/test_git_automation.py`（28 离线 + 1 可选 sandbox 集成）、
   `tests/test_migrate_codex_home_permissions.py`（17）、`tests/test_pid_guard.py`
   （10：7 项纯匹配 + 3 项 live-process，后者在无 `ps` 的 seatbelt 沙箱内跳过）、
-  `tests/test_activate_runtime_autorecovery.py`（11，激活器静态/fixture/stub 测试）。
+  `tests/test_activate_runtime_autorecovery.py`（11，激活器静态/fixture/stub 测试）、
+  `tests/test_bootstrap_autorecovery_command.py`（11，一键 bootstrap 编排 stub 测试）。
   CI 跑同一集合（集成验证除外）；可选集成测试需普通 Terminal +
   `RUN_SANDBOX_TESTS=1`；runtime supervisor 的 11 项 live 测试（含 pause-resume 与 runtime-copy 运行）在 CI（有 `ps`）
   与普通终端运行。

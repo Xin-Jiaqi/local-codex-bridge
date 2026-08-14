@@ -18,7 +18,7 @@
 
 具体到我的用法，现在常发生的是这样：我在手机上说一句，把当前仓库的 TODO 按文件整理成清单，GPT 调 /start 在本地建一个 thread 跑起来，observe 等结果，拿到清单后问我下一步。中途我想改方向，就补一句，它调 steer 把新指令排进当前这轮之后；想停，interrupt 立刻打断。整个过程我不在电脑前，对话记录留在手机里，随时能翻。
 
-手机这个界面的价值在于，它是为我服务的对话层。GPT 会把结果整理成人话，把失败原因讲清楚，把下一步的选择列出来。Codex 在本地做的那些原始输出，不用我逐个看。需要图的时候，GPT 在对话里生成示意图，或者把数据画成图，配着解释一起给我。v1.1.0 里开机自动拉起 Bridge 的 runtime、supervisor 和 launchd 代理已经写完，254 项离线测试全绿（250 通过、4 跳过）；2026-08-14 在真实 host 上完整跑过 round-trip，自动恢复实机验证通过，v1.1.0 随后发布（发布状态待最终核对）。旧版 Desktop 代理有 TCC 权限问题，运行时迁出 Desktop 正是这次改动的一部分。
+手机这个界面的价值在于，它是为我服务的对话层。GPT 会把结果整理成人话，把失败原因讲清楚，把下一步的选择列出来。Codex 在本地做的那些原始输出，不用我逐个看。需要图的时候，GPT 在对话里生成示意图，或者把数据画成图，配着解释一起给我。v1.1.0 里开机自动拉起 Bridge 的 runtime、supervisor 和 launchd 代理已经写完，254 项离线测试全绿（250 通过、4 跳过）；2026-08-14 在真实 host 上完整跑过 round-trip，自动恢复实机验证通过，v1.1.0 已于当天发布。旧版 Desktop 代理有 TCC 权限问题，运行时迁出 Desktop 正是这次改动的一部分。
 
 在外面用手机交代任务，对我来说是常态。语音输入的体验比打字顺，思路讲一半可以随时打断补充；iPhone 上的对话是我唯一要盯的界面，结果、失败原因、下一步选择都在那里。任务粒度也从一次改一个文件，慢慢变成一连串：整理清单、改代码、跑测试、写总结，中间没有需要我插手的环节。这套东西解决的是人在外面、活在家里的时差，任务不用等我到家才开工，我也不用为一次小改动专门坐到电脑前。
 
@@ -157,9 +157,9 @@ hpc 的组合（workspace-write 加 on-request 加网络开启）写死在模板
 
 集成测试的三个文件是 test_bridge_core.py、test_bridge_actions.py、test_http_api.py，按 README 手动跑，需要本机有 codex 和 DeepSeek 配置。
 
-实机验证分两轮。2026-08-13 的维护期记录：maintenance 在实机完整跑过一轮 activate 和 deactivate，窗口内 local 和公网 /health 都返回 instance=maintenance、mode=bridge-workspace、port=8323；deactivate 之后 local 的本地和公网 /health 都是 200，返回 instance=local、mode=bridge-workspace、port=8321，覆盖 maintenance 窗口切换和 health identity。2026-08-14 的真实 host round-trip：stable runtime 安装、per-instance LaunchAgent 唯一 label 装载、supervisor 实机运行（pid 43975）、对 managed bridge pid 20930 真实 TERM 后由 supervisor 补起新 pid 21216 且 local+public health 恢复、ngrok 未被误杀、final status OK、随后自动重新进入 maintenance 并验证 maintenance/bridge-workspace/8323；结尾两个 marker 都是 YES。v1.1.0 随后发布（发布状态待最终核对）。
+实机验证分两轮。2026-08-13 的维护期记录：maintenance 在实机完整跑过一轮 activate 和 deactivate，窗口内 local 和公网 /health 都返回 instance=maintenance、mode=bridge-workspace、port=8323；deactivate 之后 local 的本地和公网 /health 都是 200，返回 instance=local、mode=bridge-workspace、port=8321，覆盖 maintenance 窗口切换和 health identity。2026-08-14 的真实 host round-trip：stable runtime 安装、per-instance LaunchAgent 唯一 label 装载、supervisor 实机运行（pid 43975）、对 managed bridge pid 20930 真实 TERM 后由 supervisor 补起新 pid 21216 且 local+public health 恢复、ngrok 未被误杀、final status OK、随后自动重新进入 maintenance 并验证 maintenance/bridge-workspace/8323；结尾两个 marker 都是 YES。v1.1.0 已于 2026-08-14 发布。
 
-**版本时点。** v1.0.0 已经发布，仓库公开，BSD-3-Clause，tag 固定在 fa82e91、不移动。v1.1.0 在 2026-08-14 通过真实 host round-trip 后发布（发布状态待最终核对）：实例隔离、cwd 守卫、maintenance 维护窗口、bridge-workspace、运行时自动恢复（runtime + supervisor + per-instance LaunchAgent）、single-writer host-ops lock 和迁移脚本都在 1.1.0 线里，1.0.1 从未发布。文章里说的现在，都指这个时点。0.147.0 的 steer 排队、protected .git、profile 行为都未文档化或属于 beta，升级 Codex 前要重新验证。
+**版本时点。** v1.0.0 已经发布，仓库公开，BSD-3-Clause，tag 固定在 fa82e91、不移动。v1.1.0 已于 2026-08-14 发布，真实 host round-trip 通过：实例隔离、cwd 守卫、maintenance 维护窗口、bridge-workspace、运行时自动恢复（runtime + supervisor + per-instance LaunchAgent）、single-writer host-ops lock 和迁移脚本都在 1.1.0 线里，1.0.1 从未发布。文章里说的现在，都指这个时点。0.147.0 的 steer 排队、protected .git、profile 行为都未文档化或属于 beta，升级 Codex 前要重新验证。
 
 【图：GitHub v1.1.0 Release 页面（发布后补）】
 
@@ -181,4 +181,4 @@ python3 -m http_server --host 127.0.0.1 --port 8321
 
 如果你也在折腾手机讨论、电脑执行这类流程，可以先用本地模式把协议跑通，再决定要不要开公网口。开之前把 key 分发、沙箱模式、目录守卫这三件事想清楚，想不清楚就先别开。
 
-这套东西现在是我日常的一部分，也一直在往里补边界。文章里的数字和口径都来自当前工作区的真实状态，版本时点以 2026-08-14 v1.1.0 发布为准（发布状态待最终核对）。
+这套东西现在是我日常的一部分，也一直在往里补边界。文章里的数字和口径都来自当前工作区的真实状态，版本时点以 2026-08-14 v1.1.0 发布为准，真实 host round-trip 通过。

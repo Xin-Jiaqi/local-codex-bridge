@@ -40,7 +40,7 @@ GPT Builder。若两者不一致，以 GPT Builder 中的实际 Instructions 为
   `_config_overrides` 缺失持续 500；stable runtime 漏装
   `config/bridge-workspace.example.toml`；deactivate 在 local 恢复失败时无
   fail-safe（现自动 rollback 回 maintenance，仅双重失败才报错）。全部有
-  离线回归测试，v1.1.0 仍未发布。
+  离线回归测试，v1.1.0 已于 2026-08-14 发布。
 - 普通 task API（/start、/continue、/observe、/threads …）不获得任何
   host-op 能力；lock 只属于 host-admin 控制面入口。
 

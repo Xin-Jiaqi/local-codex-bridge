@@ -31,7 +31,7 @@
 
 ## 沙箱模式（BRIDGE_SANDBOX_MODE）
 
-> 版本说明：本节描述的是 v1.1.0（unreleased minor candidate）行为。v1.0.0
+> 版本说明：本节描述的是 v1.1.0（已发布，2026-08-14）行为。v1.0.0
 > 已发布版只有 `workspace-write` 一种沙箱边界——没有三档 `BRIDGE_SANDBOX_MODE`
 > 开关、没有 `bridge-workspace` permission profile、没有 CODEX_HOME 迁移脚本、
 > 没有实例隔离与 cwd 守卫。1.0.1 从未发布。

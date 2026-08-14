@@ -471,37 +471,39 @@ state 仍在 `${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge/<instance
 
 安全/边界：install/uninstall 只接受 `--instance local`；supervisor 只托管 local，hpc/maintenance
 按需手动起停、永不自动托管；全程无 `pkill`/`killall`，`rm -rf` 仅限 release 模式匹配的受守卫路径；
-plist 不含 secret/domain。**本次 maintenance 会话只完成实现与 temp-dir 离线测试，未实机装载 launchd**
-（`~/.local/share` 写权限在 maintenance 沙箱外）；上述命令需在普通 Terminal 由 host-admin 执行。
+plist 不含 secret/domain。**2026-08-14 已在真实主机普通 Terminal 完成完整
+bootstrap 实机验证**（runtime 安装、LaunchAgent 装载、supervisor 实机运行、
+真实 bridge crash-recovery 新 PID、maintenance→local→maintenance round-trip，
+见 `docs/release-validation-v1.1.0.md` 第 3 节）。
 
 ## V1 状态
 
-- **当前工作区 = `1.1.0` minor candidate（unreleased，未 tag 未发布）**：
-  `bridge.__version__`、`openapi.yaml`、app-server initialize clientInfo 统一为
-  `1.1.0`。范围见 CHANGELOG `[1.1.0] - Unreleased`：实例钉扎控制面隔离
+- **当前版本 = `1.1.0`（已发布，2026-08-14）**：`bridge.__version__`、
+  `openapi.yaml`、app-server initialize clientInfo 统一为 `1.1.0`。范围见
+  CHANGELOG `[1.1.0] - 2026-08-14`：实例钉扎控制面隔离
   （`local` / `hpc` / `maintenance`）、任务 cwd 守卫、多实例 LaunchAgent、
-  `migrate-current`、maintenance 维护窗口与运行时自动恢复
-  （runtime + supervisor + per-instance LaunchAgent），
+  `migrate-current`、maintenance 维护窗口、single-writer host-ops lock 与
+  运行时自动恢复（runtime + supervisor + per-instance LaunchAgent），
   以及原 1.0.1 unreleased 内容（sandbox 模式、`bridge-workspace` profile、
   CODEX_HOME 迁移 helper、PID 守卫、CI / CONTRIBUTING / docs）。**1.0.1 从未
-  发布**：本 README / CHANGELOG 不再声称 1.0.1 存在，上述能力描述均为 1.1.0
-  行为，**不要**把当前工作区当成已发布版本使用。
+  发布**：本 README / CHANGELOG 不再声称 1.0.1 存在。
 - 已发布历史：GitHub Release `v1.0.0`（`Xin-Jiaqi/local-codex-bridge`，public，
   BSD-3-Clause；tag `v1.0.0` 指向 `fa82e91`，**不移动**）。v1.0.0 发布版只有
   `workspace-write`（V1 边界）一个沙箱模式，没有实例 / cwd 守卫 / 多实例
   LaunchAgent。
-- 离线单测（当前可复现，无需 app-server，共 **223 项**，其中 208 项当前环境直接跑通）：
+- 离线单测（当前可复现，无需 app-server，共 **254 项**，其中 250 项通过、
+  4 项跳过）：
   `tests/test_config_propagation.py`（3）、`tests/test_sandbox_mode.py`（7）、
   `tests/test_instance_isolation.py`（41）、`tests/test_workspace_guard.py`（19）、
-  `tests/test_maintenance_instance.py`（40）、`tests/test_runtime_supervisor.py`（35：
-  24 离线 + 11 live 需 `ps`，无 `ps` 的 seatbelt 沙箱内跳过）、
-  `tests/test_git_automation.py`（28 离线 + 1 可选 sandbox 集成）、
+  `tests/test_maintenance_instance.py`（52）、`tests/test_runtime_supervisor.py`（43）、
+  `tests/test_git_automation.py`（29：28 离线 + 1 可选 sandbox 集成）、
   `tests/test_migrate_codex_home_permissions.py`（17）、`tests/test_pid_guard.py`
-  （10：7 项纯匹配 + 3 项 live-process，后者在无 `ps` 的 seatbelt 沙箱内跳过）、
-  `tests/test_activate_runtime_autorecovery.py`（11，激活器静态/fixture/stub 测试）、
-  `tests/test_bootstrap_autorecovery_command.py`（11，一键 bootstrap 编排 stub 测试）。
-  CI 跑同一集合（集成验证除外）；可选集成测试需普通 Terminal +
-  `RUN_SANDBOX_TESTS=1`；runtime supervisor 的 11 项 live 测试（含 pause-resume 与 runtime-copy 运行）在 CI（有 `ps`）
-  与普通终端运行。
+  （10：7 项纯匹配 + 3 项 live-process 跳过）、
+  `tests/test_activate_runtime_autorecovery.py`（11）、
+  `tests/test_bootstrap_autorecovery_command.py`（11）、
+  `tests/test_host_ops_lock.py`（11，single-writer host-ops lock）。
+  跳过 4 项：pid guard 3 项 live-process（无 `ps` 的沙箱内跳过）+ git
+  automation 1 项可选 sandbox 集成（需普通 Terminal + `RUN_SANDBOX_TESTS=1`）。
+  CI 跑同一集合（集成验证除外）。
 - 集成测试需要真实 app-server + DeepSeek key，无 CI 自动化、未在发布后复跑：`python3 tests/test_bridge_core.py`、`python3 tests/test_bridge_actions.py`、`python3 tests/test_http_api.py`。最近一次完整实测（2026-08-11）为全 PASS：core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6（历史记录）。当前 `test_http_api.py` 含 12 个唯一场景（含 openapi 校验，部署副本缺失/占位按通过处理），与历史记录的差异未复跑确认。
-- 已实测能力：start/continue/observe/steer/interrupt/list/read、本地读写、shell、native thread 连续工作、Bearer API Key、workspace-write + approval_policy=on-request、Bridge/ngrok 后台启动、PID 管理、stop 隔离、health checks、完整 stop→start→health 生命周期；runtime install/uninstall、supervisor enable/disable、crash 补起、pause-resume 与 maintenance 交接在 temp-dir 离线测试验证（launchd 实机装载见上）。
+- 已实测能力：start/continue/observe/steer/interrupt/list/read、本地读写、shell、native thread 连续工作、Bearer API Key、workspace-write + approval_policy=on-request、Bridge/ngrok 后台启动、PID 管理、stop 隔离、health checks、完整 stop→start→health 生命周期；runtime install/uninstall、supervisor enable/disable、crash 补起、pause-resume 与 maintenance 交接在 temp-dir 离线测试验证；2026-08-14 真实 host round-trip 已实机验证 runtime 安装、LaunchAgent 装载、supervisor 实机运行与真实 bridge crash-recovery（见 `docs/release-validation-v1.1.0.md` 第 3 节）。

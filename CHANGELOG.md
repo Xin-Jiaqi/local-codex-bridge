@@ -3,17 +3,17 @@
 1.0.0 之前的条目根据本地源码与 2026-08-11 测试报告重建，日期为近似值；
 仓库自 2026-08-12 起纳入 git 管理（v1.0.0，分支 `main`）。
 
-## [1.1.0] - Unreleased
+## [1.1.0] - 2026-08-14
 
-> 状态：**未发布**。当前 main 工作区为 v1.1.0 minor-release 候选；v1.0.0 tag
-> 已发布、指向 `fa82e91`，不移动。本条目来源分三类：`71274e5` 是 v1.0.0
-> 发布之后的文档 commit（已提交并 push 到 origin/main）；sandbox 模式 /
-> permission profile / CI / 发布稿等修复（原 1.0.1 unreleased 条目内容）；
-> 以及 1.1.0 新增的实例钉扎控制面隔离、cwd 守卫、多实例 LaunchAgent 与迁移。
-> 全部未发布工作统一归档到 1.1.0，避免把 post-release 修复伪装成 v1.0.0
-> 内容，也不虚构 1.0.1 已发布。
+> 状态：**已发布（2026-08-14）**。tag `v1.1.0` 指向本次 release commit；
+> v1.0.0 tag 仍指向 `fa82e91`，不移动。本条目来源分三类：`71274e5` 是
+> v1.0.0 发布之后的文档 commit（已提交并 push 到 origin/main）；sandbox
+> 模式 / permission profile / CI / 发布稿等修复（原 1.0.1 unreleased 条目
+> 内容）；以及 1.1.0 新增的实例钉扎控制面隔离、cwd 守卫、多实例
+> LaunchAgent 与迁移。全部工作统一归档到 1.1.0，避免把 post-release 修复
+> 伪装成 v1.0.0 内容，也不虚构 1.0.1 已发布。
 
-### 维护期集中修复（2026-08-14，maintenance instance 内完成，未发布）
+### 维护期集中修复（2026-08-14，maintenance instance 内完成，已随 v1.1.0 发布）
 
 - **回归 1（真实故障）：`/health` 持续 500**。`_BridgeHTTPServer` 缺少
   `_config_overrides`，readiness 读取该属性时抛 AttributeError 返回 500。
@@ -69,6 +69,22 @@
   supervisor 39→43（healthy `/health` 不触发 recovery、HTTP 200 但
   `ready=false` 触发、错误 identity 触发、静态禁止 `/ready`）。
   **测试总量 254 = 250 通过 + 4 跳过**。
+
+### 实机 round-trip 验证（2026-08-14，已通过）
+
+- 真实主机普通 Terminal 完整执行 `./scripts/activate_runtime_autorecovery.sh`：
+  single-writer host-ops lock acquire / reenter / release 正常；stable
+  runtime 安装（release `release-20260814T031607Z-8fe928ea856b`，原子
+  current 切换）；per-instance LaunchAgent 唯一 label
+  `com.local.codex-bridge.local` 装载；maintenance → local handoff 后
+  local + public /health identity=local/bridge-workspace/8321。
+- supervisor pid 43975 实机运行；对 managed bridge pid 20930 真实 TERM 后，
+  supervisor 补起新 pid 21216，local + public health 恢复、ngrok 未被误杀；
+  final status OK；随后自动重新进入 maintenance 并验证
+  identity=maintenance/bridge-workspace/8323。
+- marker：`AUTORECOVERY_ACTIVATION_OK YES`、`BOOTSTRAP_AUTORECOVERY_OK YES`。
+- 本轮真实 round-trip 同时覆盖本文档记录的全部历史回归（回归 1-5），第二轮
+  实机全部通过，未复现。细节见 `docs/release-validation-v1.1.0.md` 第 3 节。
 
 ### 运行时自动恢复：runtime + supervisor + per-instance LaunchAgent（2026-08-13）
 - 新增 `scripts/install_runtime.sh` / `scripts/uninstall_runtime.sh`：稳定

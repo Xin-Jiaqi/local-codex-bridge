@@ -18,7 +18,7 @@
 
 具体到我的用法，现在常发生的是这样：我在手机上说一句，把当前仓库的 TODO 按文件整理成清单，GPT 调 /start 在本地建一个 thread 跑起来，observe 等结果，拿到清单后问我下一步。中途我想改方向，就补一句，它调 steer 把新指令排进当前这轮之后；想停，interrupt 立刻打断。整个过程我不在电脑前，对话记录留在手机里，随时能翻。
 
-手机这个界面的价值在于，它是为我服务的对话层。GPT 会把结果整理成人话，把失败原因讲清楚，把下一步的选择列出来。Codex 在本地做的那些原始输出，不用我逐个看。需要图的时候，GPT 在对话里生成示意图，或者把数据画成图，配着解释一起给我。v1.1.0 里开机自动拉起 Bridge 的 runtime、supervisor 和 launchd 代理已经写完，223 项离线测试全绿（208 通过、15 跳过）；host activation 还没在实机完成，现阶段 Mac 登录后还是要手动开。旧版 Desktop 代理有 TCC 权限问题，运行时迁出 Desktop 正是这次改动的一部分。
+手机这个界面的价值在于，它是为我服务的对话层。GPT 会把结果整理成人话，把失败原因讲清楚，把下一步的选择列出来。Codex 在本地做的那些原始输出，不用我逐个看。需要图的时候，GPT 在对话里生成示意图，或者把数据画成图，配着解释一起给我。v1.1.0 里开机自动拉起 Bridge 的 runtime、supervisor 和 launchd 代理已经写完，254 项离线测试全绿（250 通过、4 跳过）；2026-08-14 在真实 host 上完整跑过 round-trip，自动恢复实机验证通过，v1.1.0 随后发布（发布状态待最终核对）。旧版 Desktop 代理有 TCC 权限问题，运行时迁出 Desktop 正是这次改动的一部分。
 
 在外面用手机交代任务，对我来说是常态。语音输入的体验比打字顺，思路讲一半可以随时打断补充；iPhone 上的对话是我唯一要盯的界面，结果、失败原因、下一步选择都在那里。任务粒度也从一次改一个文件，慢慢变成一连串：整理清单、改代码、跑测试、写总结，中间没有需要我插手的环节。这套东西解决的是人在外面、活在家里的时差，任务不用等我到家才开工，我也不用为一次小改动专门坐到电脑前。
 
@@ -83,7 +83,7 @@ client 的实现有两处容易出事的细节：请求按 id 和响应配对，
 
 CODEX_HOME 指向独立 profile（默认 ~/.codex-deepseek），DeepSeek provider 和 key 都在这个 profile 里，和日常终端的配置互不干扰；DEEPSEEK_API_KEY 只存在于启动 bridge 的 shell 环境。
 
-生命周期由 bash 脚本管：start、stop、status 三个入口，运行时的 PID 和锁放在 .runtime 目录，stop 只停自己启动的进程，复用 PID 前先做只读校验，校验失败只报告 stale 进程，绝不 kill。开机自启的 launchd per-instance 代理、前台 supervisor 和 pause marker 都在 v1.1.0 里写好，223 项离线测试全绿（208 通过、15 跳过）；真实装载属于 host-admin 的一次性动作，还没在实机完成。开发中实测过一条运维规则：不要从 Bridge 沙箱内部发起重启，沙箱内拉起的任何进程都会继承 seatbelt profile，连 launchctl kickstart 拉起的 job 也一样；切换沙箱模式要在普通终端里 stop 再 start。
+生命周期由 bash 脚本管：start、stop、status 三个入口，运行时的 PID 和锁放在 .runtime 目录，stop 只停自己启动的进程，复用 PID 前先做只读校验，校验失败只报告 stale 进程，绝不 kill。开机自启的 launchd per-instance 代理、前台 supervisor 和 pause marker 都在 v1.1.0 里写好，254 项离线测试全绿（250 通过、4 跳过）；真实装载在 2026-08-14 的 host round-trip 里完成。开发中实测过一条运维规则：不要从 Bridge 沙箱内部发起重启，沙箱内拉起的任何进程都会继承 seatbelt profile，连 launchctl kickstart 拉起的 job 也一样；切换沙箱模式要在普通终端里 stop 再 start。
 
 会话模型以 thread 和 turn 为句柄，thread_id 和 turn_id 是调用方唯一需要记住的两个值。continue 永远在同一个 native thread 上开新 turn，不复制历史、不重建上下文，这是模型记得前文的实现基础。thread/start 的参数固定，模型和 provider 不接受调用方覆盖，ChatGPT 不能把任务指到别的模型上。V1 没有做 MCP layer，当时的诉求就是把动作暴露成 HTTP，少一层就少一个调试环节。
 
@@ -137,6 +137,8 @@ hpc 的组合（workspace-write 加 on-request 加网络开启）写死在模板
 
 任务 cwd 有守卫。/start 接受路径前先 canonicalize 真实路径，symlink 先解析，拒绝 $HOME 及其祖先、Bridge 仓库、当前实例状态根、当前实例 CODEX_HOME；/continue 在 HTTP 层不接受 cwd 字段，thread 保持 start 时验证过的工作区，不存在扩权路径。拒绝时返回结构化 TaskCwdError，只给通用 reason 和 category，不泄露私有路径。三个实例同时运行的前提是 port 和 runtime 都互不相同，任何碰撞都 fail-closed，start、stop、status、install、verify 全部拒绝，绝不静默覆盖。
 
+这次维护期还踩过一个并发所有权的坑。多个 ChatGPT 会话可以并行跑不同的任务，这是设计内的事；但 host 控制面（activate、deactivate、runtime 安装、自动恢复脚本）同一时刻只能有一个写者。并发控制以前靠习惯，两个会话同时操作同一个控制面就会互相踩。现在控制面操作统一过一把 single-writer lock：mkdir 原子获取，记录 pid 和操作名，同一操作可重入，其他并发操作直接 BUSY，owner 退出后释放。结论是任务面可以并行，控制面必须串行。
+
 **这次踩的两个坑。** 要说明的是，这两个回归是这次 1.1.0 升级自己引入的，和运行环境无关。
 
 一个是 /health 的身份字段。health 的 payload 加了 instance、mode、port，handler 从 self.server 上取这三个值，但 BridgeHttpServer 初始化时只挂了 core、api_key、log，忘了把实例身份挂到 httpd 上，真实进程里 /health 拿不到这三个字段。这个字段对 maintenance 窗口很关键，activate 脚本要拿它验证当前到底是哪个实例在服务。旧测试没抓到，原因是集成测试只断言 status、model、model_provider，不检查新增的身份字段，单元测试用的假 server 属性齐全，同样覆盖不到真实初始化的接线。现在补的回归测试直接构造真实 BridgeHttpServer，断言 httpd.instance、httpd.mode、httpd.port 以及 /health 的实际输出。
@@ -147,21 +149,21 @@ hpc 的组合（workspace-write 加 on-request 加网络开启）写死在模板
 
 这两处都是替身测试覆盖不到真实运行时接线的典型。所以这次补的回归测试专走真实路径：真实的 BridgeHttpServer 构造，真实的启动脚本环境传播。
 
-两处修复都合进当前工作区之后，再跑一遍完整离线测试，口径就是下一节写的 208 passed、15 skipped；实机上 local 和 maintenance 的 health 也重新验证过。
+两处修复都合进当前工作区之后，再跑一遍完整离线测试，口径就是下一节写的 250 passed、4 skipped；实机上 local 和 maintenance 的 health 也重新验证过。
 
-**测试口径。** 当前工作区可复现的测试口径是 208 passed、15 skipped，这 15 项不计入通过。15 项 skipped 里，3 项是 pid guard 的 live-process 测试，需要 ps，在无 ps 的沙箱里跳过；11 项是 runtime supervisor 的 live 测试（含 pause-resume 与 runtime-copy 运行），同样需要 ps 做 PID identity 验证，沙箱里跳过、CI 和普通终端能跑；1 项是 git automation 的可选 sandbox 集成，需要 RUN_SANDBOX_TESTS=1 在普通终端跑。离线测试总数 223 项，分布是：instance isolation 41 项、maintenance 40 项、git automation 29 项、runtime supervisor 35 项、workspace guard 19 项、migrate codex home 17 项、pid guard 10 项、sandbox mode 7 项、config propagation 3 项、activation autorecovery 11 项、bootstrap autorecovery 11 项。这 208 项在当前环境直接跑通；另外 14 项（11 项 supervisor live、3 项 pid-guard live）需要普通终端里可用的 ps 做 PID identity 验证，1 项需要普通终端加 RUN_SANDBOX_TESTS=1 跑。
+**测试口径。** 当前工作区可复现的测试口径是 250 passed、4 skipped，这 4 项不计入通过。4 项 skipped 里，3 项是 pid guard 的 live-process 测试，需要 ps，在无 ps 的沙箱里跳过；1 项是 git automation 的可选 sandbox 集成，需要 RUN_SANDBOX_TESTS=1 在普通终端跑。离线测试总数 254 项，分布是：instance isolation 41 项、maintenance 52 项、git automation 29 项、runtime supervisor 43 项、workspace guard 19 项、migrate codex home 17 项、pid guard 10 项、sandbox mode 7 项、config propagation 3 项、activation autorecovery 11 项、bootstrap autorecovery 11 项、host ops lock 11 项。这 250 项在当前环境直接跑通。
 
 集成测试需要真实 app-server 和 DeepSeek key，不进 CI。2026-08-11 的完整手动实测记录是 core 5/5、actions 7/7、HTTP API 11/11。当前 test_http_api.py 里有 12 个唯一场景，比历史记录多 1 项，新增的那项没有复跑确认。
 
 集成测试的三个文件是 test_bridge_core.py、test_bridge_actions.py、test_http_api.py，按 README 手动跑，需要本机有 codex 和 DeepSeek 配置。
 
-实机验证部分（2026-08-13 当天的记录）：maintenance 在实机完整跑过一轮 activate 和 deactivate，窗口内 local 和公网 /health 都返回 instance=maintenance、mode=bridge-workspace、port=8323；deactivate 之后 local 的本地和公网 /health 都是 200，返回 instance=local、mode=bridge-workspace、port=8321。这次验证覆盖的是 maintenance 窗口切换和 health identity；1.1.0 的 runtime/supervisor/launchd 自动恢复，host activation 仍然 pending。
+实机验证分两轮。2026-08-13 的维护期记录：maintenance 在实机完整跑过一轮 activate 和 deactivate，窗口内 local 和公网 /health 都返回 instance=maintenance、mode=bridge-workspace、port=8323；deactivate 之后 local 的本地和公网 /health 都是 200，返回 instance=local、mode=bridge-workspace、port=8321，覆盖 maintenance 窗口切换和 health identity。2026-08-14 的真实 host round-trip：stable runtime 安装、per-instance LaunchAgent 唯一 label 装载、supervisor 实机运行（pid 43975）、对 managed bridge pid 20930 真实 TERM 后由 supervisor 补起新 pid 21216 且 local+public health 恢复、ngrok 未被误杀、final status OK、随后自动重新进入 maintenance 并验证 maintenance/bridge-workspace/8323；结尾两个 marker 都是 YES。v1.1.0 随后发布（发布状态待最终核对）。
 
-**版本时点。** v1.0.0 已经发布，仓库公开，BSD-3-Clause，tag 固定在 fa82e91、不移动。本文写的这个时点，v1.1.0 还在未发布状态：实例隔离、cwd 守卫、maintenance 维护窗口、bridge-workspace、运行时自动恢复（runtime + supervisor + per-instance LaunchAgent）和迁移脚本都在 1.1.0 线里，1.0.1 从未发布。文章里说的现在，都指这个时点。等 v1.1.0 正式发 GitHub Release，再按 release notes 同步一遍。0.147.0 的 steer 排队、protected .git、profile 行为都未文档化或属于 beta，升级 Codex 前要重新验证。
+**版本时点。** v1.0.0 已经发布，仓库公开，BSD-3-Clause，tag 固定在 fa82e91、不移动。v1.1.0 在 2026-08-14 通过真实 host round-trip 后发布（发布状态待最终核对）：实例隔离、cwd 守卫、maintenance 维护窗口、bridge-workspace、运行时自动恢复（runtime + supervisor + per-instance LaunchAgent）、single-writer host-ops lock 和迁移脚本都在 1.1.0 线里，1.0.1 从未发布。文章里说的现在，都指这个时点。0.147.0 的 steer 排队、protected .git、profile 行为都未文档化或属于 beta，升级 Codex 前要重新验证。
 
 【图：GitHub v1.1.0 Release 页面（发布后补）】
 
-**自动恢复。** 这一版的运行时部署是显式两步：`install_runtime.sh --instance local` 把运行必需的 allowlisted 文件装进 `~/.local/share/local-codex-bridge/`（staging + 原子 current 符号链接，保留最近两个 release，写无 secret 的 `.runtime-build-info`），再把 local 的 key/domain 路径引用从 Desktop 迁到 `~/.config/local-codex-bridge/`（目录 700、文件 600，内容不打印、原文件不删）；然后 `install_launch_agent.sh --instance local` 装 per-instance LaunchAgent。恢复矩阵一句话：ngrok 网络闪断自己重连；bridge/ngrok 真退出由 supervisor 退避补起；supervisor 崩溃、logout、reboot 由 launchd 拉回；维护窗口用 pause marker 停住 local（supervisor 存活，launchd 不 crash-loop），清 marker 即恢复，不碰 hpc。launchd 真实装载属于 host-admin 一次性动作，仓库侧只交付实现与离线测试，未声称已完成实机装载。
+**自动恢复。** 这一版的运行时部署是显式两步：`install_runtime.sh --instance local` 把运行必需的 allowlisted 文件装进 `~/.local/share/local-codex-bridge/`（staging + 原子 current 符号链接，保留最近两个 release，写无 secret 的 `.runtime-build-info`），再把 local 的 key/domain 路径引用从 Desktop 迁到 `~/.config/local-codex-bridge/`（目录 700、文件 600，内容不打印、原文件不删）；然后 `install_launch_agent.sh --instance local` 装 per-instance LaunchAgent。恢复矩阵一句话：ngrok 网络闪断自己重连；bridge/ngrok 真退出由 supervisor 退避补起；supervisor 崩溃、logout、reboot 由 launchd 拉回；维护窗口用 pause marker 停住 local（supervisor 存活，launchd 不 crash-loop），清 marker 即恢复，不碰 hpc。launchd 真实装载在 2026-08-14 的 host round-trip 里完成：真实 TERM 一个 managed bridge 进程，supervisor 用新 PID 补起，local 和公网 health 恢复，ngrok 没被误杀。
 
 **已知限制。** thread 状态在 app-server 进程内存里，Bridge 重启即丢，长任务依赖调用方循环 observe；没有多租户、审计和审批流；只在 macOS arm64 和 codex 0.147.0 上实测过。运行时日志包含 thread 内容和命令文本，别往日志里放秘密。
 
@@ -179,4 +181,4 @@ python3 -m http_server --host 127.0.0.1 --port 8321
 
 如果你也在折腾手机讨论、电脑执行这类流程，可以先用本地模式把协议跑通，再决定要不要开公网口。开之前把 key 分发、沙箱模式、目录守卫这三件事想清楚，想不清楚就先别开。
 
-这套东西现在是我日常的一部分，也一直在往里补边界。文章里的数字和口径都来自当前工作区的真实状态，版本时点以 v1.1.0 未发布为准。等它正式发布，我会把这篇再同步一遍。
+这套东西现在是我日常的一部分，也一直在往里补边界。文章里的数字和口径都来自当前工作区的真实状态，版本时点以 2026-08-14 v1.1.0 发布为准（发布状态待最终核对）。

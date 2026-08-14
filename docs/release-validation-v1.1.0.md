@@ -1,9 +1,8 @@
 # Release Validation — v1.1.0
 
-> 日期：2026-08-14（2026-08-13 基线 + 2026-08-14 维护期集中修复复跑）·
-> 本文档只记录可复现的离线门禁与静态检查结果。
-> Host runtime activation **仍未在实机执行**（见文末），本文档不声称
-> launchd live verified。
+> 日期：2026-08-14（2026-08-13 基线 + 2026-08-14 维护期集中修复复跑 +
+> 2026-08-14 真实 host round-trip 验证）。本文档记录可复现的离线门禁、
+> 静态检查与实机验证结果；launchd live verified 见第 3 节。
 
 ## 1. Safe offline suite（12 文件，可复现命令）
 
@@ -113,16 +112,40 @@ done
    pause + 停 local → maintenance rollback 且 rollback public 延迟后成功；
    真正超时才 DOUBLE FAILURE），全部 tmp/fake。
 
-## 3. Host activation 状态（明确 PENDING）
+以上修复全部随 2026-08-14 真实 host round-trip 第二轮实机通过，未复现
+（见第 3 节）。
 
-- 未在真实主机执行 `./scripts/activate_runtime_autorecovery.sh`；
-- 未完成：runtime 安装、per-instance LaunchAgent 装载、supervisor 实机运行、
-  bridge crash-recovery 实机自测、公网 /health 验证；
-- 因此 release notes / 本文档口径 = 「实现 + 离线测试已通过（248 = 244 + 4），
-  实机装载待 host-admin」；不声称 launchd live verified。
-- 实机执行前置条件：maintenance window ACTIVE（`activate_maintenance_instance.sh`
-  成功且 local+public /health = maintenance/bridge-workspace/8323），普通 Terminal
-  执行上面那一条命令；失败会打印阶段名并非零退出，不打印 domain/secret。
+## 3. 真实 host round-trip 验证（2026-08-14，已通过）
+
+前置条件（maintenance window ACTIVE：local+public /health =
+maintenance/bridge-workspace/8323）满足后，在真实主机普通 Terminal 完整执行
+`./scripts/activate_runtime_autorecovery.sh`，记录如下（不写 domain/secret）：
+
+- **single-writer host-ops lock**：activate / deactivate / autorecovery 全程
+  经 `scripts/host_ops_lock_lib.sh`：acquire → 同 token reenter → EXIT trap
+  release 均正常，无并发 BUSY 误报、无 stale 误判。
+- **stable runtime 安装**：runtime release
+  `release-20260814T031607Z-8fe928ea856b` 经 staging + 原子 current 切换装入
+  `${XDG_DATA_HOME:-$HOME/.local/share}/local-codex-bridge/`，install 自检
+  （runtime marker、依赖文件、不含 secret/domain）通过。
+- **LaunchAgent 唯一 label**：per-instance LaunchAgent 以唯一 label
+  `com.local.codex-bridge.local` 装载，legacy/Desktop 旧代理已安全迁移，
+  无重复 label 冲突。
+- **maintenance → local handoff**：runtime 验证完成后 maintenance 退出、
+  local 恢复；local + public /health 均 200，identity=local/bridge-workspace/8321。
+- **supervisor 实机运行**：supervisor 以 pid 43975 前台运行，`supervisor.enabled`
+  哨兵与 launchd PathState 一致。
+- **真实 bridge crash recovery（新 PID）**：对 managed bridge 进程 pid 20930
+  发送真实 TERM；supervisor 按退避策略补起新进程 pid 21216；local + public
+  health 恢复；ngrok 进程未被误杀。
+- **final status OK**；随后脚本自动重新进入 maintenance 窗口，并验证
+  local + public identity=maintenance/bridge-workspace/8323。
+- **两个 YES marker**：`AUTORECOVERY_ACTIVATION_OK YES`、
+  `BOOTSTRAP_AUTORECOVERY_OK YES`。
+
+第 2b 节记录的历史故障（`_config_overrides` 缺失、runtime `config/` 缺失、
+supervisor 误用不存在的 `/ready`、deactivate public handoff / rollback race）
+均已修复，本轮真实 host round-trip 第二轮验证全部通过，未复现。
 
 ### Prior live maintenance verification（2026-08-13，operator 当天实际输出记录）
 
@@ -136,4 +159,5 @@ done
   `instance=local`、`mode=bridge-workspace`、`port=8321`。
 
 该记录来自 operator 当天实际输出，不写真实 domain 值；host activation
-（runtime 安装、LaunchAgent 装载、supervisor 实机运行）仍为 PENDING。
+（runtime 安装、LaunchAgent 装载、supervisor 实机运行）已于 2026-08-14
+完成，见第 3 节。

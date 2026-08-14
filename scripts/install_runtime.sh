@@ -10,8 +10,10 @@
 #   - each install stages into releases/ and atomically flips the `current`
 #     symlink (a release is never modified in place);
 #   - the runtime copy contains ONLY runtime-required TRACKED allowlisted
-#     files (python packages + start/stop/supervisor/control scripts); no
-#     .git, tests, docs, schemas, backups, logs, secrets or domain files;
+#     files (python packages + start/stop/supervisor/control scripts +
+#     config/bridge-workspace.example.toml, the workspace profile the
+#     supervisor/start flow depends on); no .git, tests, docs, schemas,
+#     backups, logs, secrets or domain files;
 #   - writes a secret-free manifest (release/head/dirty/time/allowlist count);
 #   - keeps the most recent N releases (default 2); pruning is guarded by a
 #     strict absolute-path/name check (never touches `current` or anything
@@ -79,13 +81,17 @@ mkdir -p "$DATA_ROOT" "$RELEASES_DIR"
 chmod 700 "$DATA_ROOT" "$RELEASES_DIR"
 
 # Runtime-required allowlist (top-level entries; every file must be tracked).
+# config/ carries config/bridge-workspace.example.toml - the bridge-workspace
+# permission profile example the stable runtime start flow depends on.
 # Deliberately EXCLUDES .git, tests, docs, schemas, openapi, backups, logs,
 # .bridge_* secrets/domain files and the legacy .runtime dir.
 ALLOWLIST=(
   bridge
   http_server
+  config
   scripts/bridge_instance_lib.sh
   scripts/bridge_mode_lib.sh
+  scripts/bridge_secret_lib.sh
   scripts/pid_guard_lib.sh
   scripts/start_ngrok_bridge.sh
   scripts/stop_ngrok_bridge.sh

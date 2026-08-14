@@ -19,6 +19,12 @@
 #     a missing marker (pre-runtime window) is treated as enabled so legacy
 #     windows still restore local;
 #   - verifies local/public health when local was restored;
+#   - fail-safe rollback: the maintenance stop is the point of no return, so
+#     from that moment ANY failure (local restore / local health / identity /
+#     public health) automatically re-opens the maintenance window and
+#     verifies maintenance/bridge-workspace/8323 + public health; only when
+#     that rollback ALSO fails is an explicit DOUBLE FAILURE reported (the
+#     original failure reason is always preserved);
 #   - NEVER deletes the maintenance state or $HOME/.codex-deepseek-maintenance
 #     (they are reused by the next maintenance window);
 #   - never touches hpc, Para/Japan or remote jobs.
@@ -31,9 +37,101 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/bridge_instance_lib.sh"
 . "$ROOT/scripts/supervisor_control.sh"
+. "$ROOT/scripts/host_ops_lock_lib.sh"
 
 log() { printf '[deactivate-maintenance] %s\n' "$*"; }
-die() { printf '[deactivate-maintenance] error: %s\n' "$*" >&2; exit 1; }
+
+ROLLBACK_ARMED=0
+ROLLBACK_DONE=0
+ROLLBACK_LOG=""
+
+# Fail-safe rollback to the maintenance window. Armed BEFORE the maintenance
+# stop: once maintenance is down, ANY failure in the local restore or the
+# local/public health verification must bring the fixed public endpoint back
+# to maintenance instead of leaving the control plane dark. Brings
+# maintenance back up through the sanctioned start path (managed processes
+# only), re-raises the local pause hold + activation marker so the window
+# state stays consistent, and verifies maintenance identity
+# (maintenance/bridge-workspace/8323) + public health. Only when this
+# rollback itself fails is an explicit DOUBLE FAILURE reported. The original
+# failure reason always remains the exit reason; no secret/domain content is
+# printed.
+rollback() {
+  [[ "${ROLLBACK_ARMED:-0}" == 1 && "${ROLLBACK_DONE:-0}" == 0 ]] || return 0
+  ROLLBACK_DONE=1
+  local mport="" murl="" domain="" ref="" ok=0 rlog=""
+  rlog="$(bridge_instance_get "$LOCAL" runtime_dir 2>/dev/null || true)/deactivate-rollback.log"
+  [[ -n "$rlog" ]] || rlog="$ROOT/.runtime/deactivate-rollback.log"
+  mkdir -p "$(dirname "$rlog")" 2>/dev/null || true
+  printf '[deactivate-maintenance] rollback: local restore/health failed; fail-safe restoring the maintenance window (managed processes only; hpc/Para/Japan and remote jobs are never touched)\n' >&2
+  # 1. Re-raise the local pause hold + activation marker so the window state
+  #    stays consistent for the next deactivate (local stays stopped).
+  if [[ -n "${PAUSE_MARKER:-}" ]]; then
+    mkdir -p "$(dirname "$PAUSE_MARKER")" 2>/dev/null || true
+    touch "$PAUSE_MARKER" 2>/dev/null || true
+    chmod 600 "$PAUSE_MARKER" 2>/dev/null || true
+  fi
+  if [[ -n "${MARKER:-}" && ! -f "$MARKER" ]]; then
+    printf 'instance=%s\nsupervisor_state=%s\n' "$INSTANCE" "${PRE_SUPERVISOR:-enabled}" > "$MARKER" 2>/dev/null || true
+    chmod 600 "$MARKER" 2>/dev/null || true
+  fi
+  # 2. Bring maintenance back up (best-effort: it may already be up when the
+  #    stop itself failed).
+  BRIDGE_INSTANCE="$INSTANCE" "$ROOT/scripts/start_ngrok_bridge.sh" >>"$rlog" 2>&1 || true
+  # 3. Verify maintenance identity + public health.
+  mport="$(bridge_instance_get "$INSTANCE" port 2>/dev/null || true)"
+  [[ -n "$mport" ]] || mport="8323"
+  murl="http://127.0.0.1:$mport"
+  if bridge_health_ok "$murl" "$rlog" \
+     && bridge_health_identity "$murl" "$INSTANCE" "bridge-workspace" "$mport" "$rlog"; then
+    ok=1
+  fi
+  ref="$(bridge_instance_get "$INSTANCE" ngrok_domain_file 2>/dev/null || true)"
+  if [[ -n "$ref" && -f "$ref" ]]; then
+    domain="$(tr -d '[:space:]' < "$ref" 2>/dev/null || true)"
+  fi
+  if [[ -z "$domain" && -f "$ROOT/.ngrok_domain" ]]; then
+    domain="$(tr -d '[:space:]' < "$ROOT/.ngrok_domain" 2>/dev/null || true)"
+  fi
+  if [[ "$ok" == 1 && -n "$domain" ]]; then
+    bridge_health_ok "https://$domain" "$rlog" || ok=0
+  fi
+  if [[ "$ok" == 1 ]]; then
+    printf '[deactivate-maintenance] rollback: maintenance window restored and verified (instance=%s mode=bridge-workspace port=%s, local+public health OK); the original failure remains the exit reason (rollback log: %s)\n' \
+      "$INSTANCE" "$mport" "$rlog" >&2
+    return 0
+  fi
+  printf '[deactivate-maintenance] DOUBLE FAILURE: local restore/health failed AND the maintenance rollback could not be verified (instance=%s port=%s, local+public health); the public control plane may be DOWN - manual host intervention required (rollback log: %s)\n' \
+    "$INSTANCE" "$mport" "$rlog" >&2
+  return 1
+}
+
+# Explicit failure: print the reason, attempt the fail-safe maintenance
+# rollback, then exit nonzero (the rollback never masks the original error).
+die() {
+  trap - ERR 2>/dev/null || true
+  printf '[deactivate-maintenance] error: %s\n' "$*" >&2
+  rollback
+  exit 1
+}
+
+# ERR trap (armed only from the maintenance stop on): fail-safe rollback to
+# the maintenance window, then exit with the failing command's status.
+on_error() {
+  local rc=$?
+  trap - ERR 2>/dev/null || true
+  printf '[deactivate-maintenance] error: command failed (exit %s) at line %s (see %s)\n' \
+    "$rc" "${BASH_LINENO[0]}" "${ROLLBACK_LOG:-$ROOT/.runtime/deactivate-rollback.log}" >&2
+  rollback
+  exit "${rc:-1}"
+}
+
+# Global single-writer host-ops lock: only one control-plane mutation runs
+# at a time (humans / ChatGPT / unattended automation). BUSY when another
+# host op holds the lock; sub-scripts called from this parent re-enter via
+# the exported token; released automatically on EXIT.
+host_ops_lock_acquire "deactivate-maintenance" || die \
+  "another host operation holds the host-ops lock; concurrent control-plane writes are refused (retry after it exits; run ./scripts/status_launch_agent.sh --instance local to inspect)"
 
 INSTANCE="maintenance"
 LOCAL="local"
@@ -50,6 +148,13 @@ bridge_instance_exists "$LOCAL" || die \
 
 # 1. Stop maintenance (managed processes only; maintenance state/CODEX_HOME
 #    are deliberately left in place for the next window).
+# Fail-safe: armed BEFORE the maintenance stop (the point of no return).
+# From here on, ANY failure (ERR trap or explicit die) fail-safe restores
+# the maintenance window (see rollback()). Disarmed only after the FULL
+# local restore + identity + public health verification below.
+ROLLBACK_ARMED=1
+trap on_error ERR
+log "rollback armed: any subsequent failure will fail-safe restore the maintenance window"
 log "stopping BRIDGE_INSTANCE=maintenance (managed processes only)"
 BRIDGE_INSTANCE="$INSTANCE" "$ROOT/scripts/stop_ngrok_bridge.sh" || die "failed to stop the maintenance instance"
 
@@ -120,7 +225,7 @@ fi
 LOCAL_PORT="$(bridge_instance_get "$LOCAL" port)"
 LOCAL_URL="http://127.0.0.1:$LOCAL_PORT"
 ok=0
-for i in $(seq 1 30); do
+for i in $(seq 1 "${DEACTIVATE_HEALTH_WAIT:-30}"); do
   if bridge_health_ok "$LOCAL_URL" "$DEACTIVATE_LOG"; then
     ok=1
     break
@@ -151,6 +256,13 @@ if [[ -n "$DOMAIN" ]]; then
 else
   log "public endpoint skipped: no ngrok domain configured for local (local-only mode)"
 fi
+
+# Full pass complete: local health + identity + public health all verified.
+# Disarm the fail-safe rollback before finalizing (marker removal + logs).
+trap - ERR
+ROLLBACK_ARMED=0
+ROLLBACK_DONE=0
+log "rollback disarmed: deactivation completed successfully"
 
 rm -f "$MARKER"
 log "maintenance window CLOSED: BRIDGE_INSTANCE=local active (pause marker cleared; supervisor state restored: $PRE_SUPERVISOR)"

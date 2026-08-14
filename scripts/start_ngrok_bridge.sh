@@ -51,6 +51,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/scripts/bridge_mode_lib.sh"
 . "$ROOT/scripts/bridge_instance_lib.sh"
+. "$ROOT/scripts/bridge_secret_lib.sh"
 . "$ROOT/scripts/pid_guard_lib.sh"
 
 RUNTIME_DIR="$ROOT/.runtime"
@@ -308,6 +309,15 @@ validate_sandbox_env() {
 
 ensure_bridge() {
   local pid=""
+  # Provider secret: load DEEPSEEK_API_KEY from the macOS Keychain (the
+  # persistent secret ref) into the bridge/app-server child environment.
+  # Fail closed: without it the Codex app-server cannot start, so the bridge
+  # must not start either (readiness stays false).
+  if ! bridge_secret_load_deepseek; then
+    fail "provider secret unavailable (Keychain ref $(bridge_secret_service)/$(bridge_secret_account) unreadable); refusing to start the app-server (readiness will stay false until the secret ref is restored)"
+  fi
+  export DEEPSEEK_API_KEY
+
   if [[ -f "$BRIDGE_PID_FILE" ]]; then
     pid="$(cat "$BRIDGE_PID_FILE" 2>/dev/null || true)"
   fi

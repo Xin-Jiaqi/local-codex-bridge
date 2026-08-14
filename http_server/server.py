@@ -385,7 +385,7 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             path = urllib.parse.urlparse(self.path).path
-            if path == "/health":
+            if path == "/health" or path == "/ready":
                 self._handle_health()
                 return
             if path == "/threads":
@@ -438,19 +438,44 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ handlers
 
+    def _provider_config_ok(self):
+        """True when the pinned model/provider config is complete and the
+        app-server spawn actually carried model/model_provider overrides."""
+        return bool(MODEL) and bool(MODEL_PROVIDER) and any(
+            o.startswith('model="') for o in self.server._config_overrides
+        ) and any(
+            o.startswith('model_provider="') for o in self.server._config_overrides
+        )
+
+    def _readiness(self):
+        """Non-sensitive readiness: app-server alive + provider secret ref
+        readable (presence only, never the value) + provider config complete."""
+        alive = self.server.core.client.alive
+        secret = bool(os.environ.get("DEEPSEEK_API_KEY"))
+        config_ok = self._provider_config_ok()
+        return {
+            "ready": bool(alive and secret and config_ok),
+            "app_server_alive": alive,
+            "provider_secret": secret,
+            "provider_config_ok": config_ok,
+        }
+
     def _handle_health(self):
         core = self.server.core
-        alive = core.client.alive
+        r = self._readiness()
         payload = {
-            "status": "ok" if alive else "unavailable",
-            "app_server_alive": alive,
+            "status": "ok" if r["ready"] else "unavailable",
+            "ready": r["ready"],
+            "app_server_alive": r["app_server_alive"],
+            "provider_secret": r["provider_secret"],
+            "provider_config_ok": r["provider_config_ok"],
             "model": core.model,
             "model_provider": core.model_provider,
             "instance": self.server.instance or None,
             "mode": self.server.mode or None,
             "port": self.server.port,
         }
-        self._send_json(200 if alive else 503, payload)
+        self._send_json(200 if r["ready"] else 503, payload)
 
     def _handle_start(self, body):
         prompt = self._require_str(body, "prompt")
@@ -604,10 +629,13 @@ class BridgeHttpServer:
         self.port = port
         self.instance = instance
         self.mode = mode
+        self._config_overrides = list(
+            config_overrides if config_overrides is not None else CONFIG_OVERRIDES
+        )
         self.client = CodexAppServerClient(
             codex_bin,
             codex_home,
-            config_overrides if config_overrides is not None else CONFIG_OVERRIDES,
+            self._config_overrides,
             child_env=child_env,
             logger=self.log,
         )
@@ -622,6 +650,7 @@ class BridgeHttpServer:
         self.httpd.core = self.core
         self.httpd.api_key = api_key
         self.httpd.log = self.log
+        self.httpd._config_overrides = self._config_overrides
         self.port = self.httpd.server_address[1]
         self.httpd.instance = instance
         self.httpd.mode = mode

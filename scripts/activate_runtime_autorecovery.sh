@@ -44,6 +44,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/bridge_instance_lib.sh"
 . "$ROOT/scripts/pid_guard_lib.sh"
 . "$ROOT/scripts/supervisor_control.sh"
+. "$ROOT/scripts/host_ops_lock_lib.sh"
 
 STAGE=""
 AR_LOG=""
@@ -249,6 +250,11 @@ bridge_crash_recovery() {
 }
 
 main() {
+  # Global single-writer host-ops lock: only one control-plane mutation runs
+  # at a time. When this script is called by the bootstrap orchestration the
+  # exported token makes it reentrant; released automatically on EXIT.
+  host_ops_lock_acquire "activate-runtime-autorecovery" || die \
+    "another host operation holds the host-ops lock; concurrent control-plane writes are refused (retry after it exits)"
   verify_maintenance_preflight
   ensure_local_pause_marker
   install_and_verify_runtime

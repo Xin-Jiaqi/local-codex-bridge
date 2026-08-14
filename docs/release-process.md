@@ -19,8 +19,8 @@
    tests/test_maintenance_instance.py tests/test_git_automation.py
    tests/test_migrate_codex_home_permissions.py tests/test_pid_guard.py
    tests/test_runtime_supervisor.py tests/test_activate_runtime_autorecovery.py
-   tests/test_bootstrap_autorecovery_command.py`
-   全绿（CI 跑同一 11 文件集合；runtime supervisor 的 11 项 live
+   tests/test_bootstrap_autorecovery_command.py tests/test_host_ops_lock.py`
+   全绿（CI 跑同一 12 文件集合；runtime supervisor 的 11 项 live
    测试与 pid guard 的 3 项 live 测试需要 `ps`，CI/普通终端可跑，无 `ps` 的
    seatbelt 沙箱内跳过；git automation 的 1 项可选 sandbox 集成需要
    `RUN_SANDBOX_TESTS=1` 在普通终端跑。2026-08-13 沙箱实测口径：223 项 =

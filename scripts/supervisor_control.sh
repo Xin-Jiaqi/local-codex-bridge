@@ -169,6 +169,7 @@ supervisor_restore() {
 
 supervisor_status() {
   local sentinel="" pid="" current="" release="" agent="not installed"
+  local lport="" ready="unknown"
   sentinel="$(supervisor_sentinel)"
   if [[ -n "$sentinel" && -f "$sentinel" ]]; then
     printf 'supervisor: enabled (%s)\n' "$sentinel"
@@ -181,6 +182,15 @@ supervisor_status() {
   else
     printf 'supervisor_pid: not running\n'
   fi
+  lport="$(bridge_instance_get local port 2>/dev/null || true)"
+  if [[ -n "$lport" ]]; then
+    if bridge_health_ready "http://127.0.0.1:$lport" /dev/null 2>/dev/null; then
+      ready="true"
+    else
+      ready="false"
+    fi
+  fi
+  printf 'readiness: %s\n' "$ready"
   if supervisor_agent_loaded; then
     agent="loaded ($SUPERVISOR_AGENT_LABEL)"
   elif supervisor_agent_installed; then

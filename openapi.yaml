@@ -25,10 +25,14 @@ paths:
       operationId: codexHealth
       x-openai-isConsequential: false
       summary: Health check (no auth required)
+      description: >
+        Real readiness gate: HTTP 200 only when the app-server is alive, the
+        provider secret reference (macOS Keychain) is readable and the
+        model/provider config is complete. Never leaks secret content.
       security: []
       responses:
         "200":
-          description: Server and app-server alive
+          description: Bridge fully ready (app-server alive + provider secret ref + config)
           content:
             application/json:
               schema:
@@ -37,7 +41,14 @@ paths:
                   status:
                     type: string
                     enum: [ok]
+                  ready:
+                    type: boolean
                   app_server_alive:
+                    type: boolean
+                  provider_secret:
+                    type: boolean
+                    description: Provider secret reference readable (presence only, never the value)
+                  provider_config_ok:
                     type: boolean
                   model:
                     type: string
@@ -52,6 +63,46 @@ paths:
                   port:
                     type: integer
                     description: HTTP port the bridge is actually listening on
+        "503":
+          $ref: "#/components/responses/Error"
+  /ready:
+    get:
+      operationId: codexReady
+      x-openai-isConsequential: false
+      summary: Readiness probe (no auth required)
+      description: >
+        Non-sensitive readiness for supervisors and tunnels. Same payload and
+        status semantics as /health.
+      security: []
+      responses:
+        "200":
+          description: Bridge fully ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  ready:
+                    type: boolean
+                  app_server_alive:
+                    type: boolean
+                  provider_secret:
+                    type: boolean
+                  provider_config_ok:
+                    type: boolean
+                  model:
+                    type: string
+                  model_provider:
+                    type: string
+                  instance:
+                    type: [string, "null"]
+                  mode:
+                    type: [string, "null"]
+                  port:
+                    type: integer
         "503":
           $ref: "#/components/responses/Error"
   /start:

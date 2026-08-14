@@ -33,7 +33,12 @@ if ROOT not in sys.path:
 
 from bridge import BridgeCore, Logger
 from bridge.workspace_guard import TaskCwdError
-from http_server.server import BridgeHttpHandler, BridgeHttpServer, build_cwd_guard
+from http_server.server import (
+    CONFIG_OVERRIDES,
+    BridgeHttpHandler,
+    BridgeHttpServer,
+    build_cwd_guard,
+)
 
 LIB = os.path.join(ROOT, "scripts", "bridge_instance_lib.sh")
 ADMIN = os.path.join(ROOT, "scripts", "bridge_instance.sh")
@@ -434,13 +439,22 @@ class HttpMaintenanceScopeTest(unittest.TestCase):
 
 
 class _FakeServer:
-    def __init__(self, core, instance="maintenance", mode="bridge-workspace", port=8323):
+    def __init__(self, core, instance="maintenance", mode="bridge-workspace",
+                 port=8323, config_overrides=None):
         self.core = core
         self.instance = instance
         self.mode = mode
         self.port = port
         self.api_key = "secret-key"
         self.log = Logger(echo=False)
+        # mirrors the REAL _BridgeHTTPServer wiring: /health reads the same
+        # model/model_provider overrides that were passed to the app-server
+        # spawn (a fake WITHOUT this attribute is exactly the regression that
+        # used to 500 on the real server)
+        self._config_overrides = (
+            list(config_overrides) if config_overrides is not None
+            else list(CONFIG_OVERRIDES)
+        )
 
 
 class HealthMetadataTest(unittest.TestCase):
@@ -454,14 +468,88 @@ class HealthMetadataTest(unittest.TestCase):
         handler.requestline = "GET /health HTTP/1.1"
         handler.request_version = "HTTP/1.1"
         handler.wfile = io.BytesIO()
-        handler._handle_health()
+        old_key = os.environ.get("DEEPSEEK_API_KEY")
+        os.environ["DEEPSEEK_API_KEY"] = "dummy-test-key-not-a-secret"
+        try:
+            handler._handle_health()
+        finally:
+            if old_key is None:
+                os.environ.pop("DEEPSEEK_API_KEY", None)
+            else:
+                os.environ["DEEPSEEK_API_KEY"] = old_key
         raw = handler.wfile.getvalue().decode("utf-8")
         body = json.loads(raw.split("\r\n\r\n", 1)[1])
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["instance"], "maintenance")
         self.assertEqual(body["mode"], "bridge-workspace")
         self.assertEqual(body["port"], 8323)
+        self.assertTrue(body["provider_config_ok"])
+        self.assertTrue(body["provider_secret"])
+        self.assertTrue(body["ready"])
 
+    def test_health_real_bridge_http_server_config_overrides_wiring(self):
+        """Regression: /health on the REAL BridgeHttpServer must never 500.
+
+        The uncommitted live fix wires `self.httpd._config_overrides = ...`
+        into the real _BridgeHTTPServer; without it _provider_config_ok()
+        raises AttributeError and /health returns 500. This test drives the
+        real server object (no fake handler server) and asserts the
+        readiness provider_config_ok is reported instead of an exception.
+        """
+        overrides = ['model="deepseek-chat"', 'model_provider="deepseek"']
+        server = BridgeHttpServer(
+            "codex", "/tmp/lcb-nonexistent-home", "secret-key",
+            host="127.0.0.1", port=0, instance="maintenance",
+            mode="bridge-workspace", config_overrides=overrides,
+        )
+        try:
+            # the exact attribute the live fix must carry on the real server
+            self.assertEqual(server.httpd._config_overrides, overrides)
+            handler = object.__new__(BridgeHttpHandler)
+            handler.server = server.httpd
+            handler.requestline = "GET /health HTTP/1.1"
+            handler.request_version = "HTTP/1.1"
+            handler.wfile = io.BytesIO()
+            old_key = os.environ.get("DEEPSEEK_API_KEY")
+            os.environ["DEEPSEEK_API_KEY"] = "dummy-test-key-not-a-secret"
+            try:
+                handler._handle_health()
+            finally:
+                if old_key is None:
+                    os.environ.pop("DEEPSEEK_API_KEY", None)
+                else:
+                    os.environ["DEEPSEEK_API_KEY"] = old_key
+            raw = handler.wfile.getvalue().decode("utf-8")
+            body = json.loads(raw.split("\r\n\r\n", 1)[1])
+            self.assertTrue(body["provider_config_ok"], body)
+            self.assertTrue(body["provider_secret"], body)
+            self.assertFalse(body["app_server_alive"])  # client not started
+            self.assertFalse(body["ready"])
+            self.assertEqual(body["status"], "unavailable")
+            self.assertEqual(body["instance"], "maintenance")
+        finally:
+            server.httpd.server_close()
+
+    def test_health_config_overrides_default_model_wiring(self):
+        """The default (no explicit overrides) still carries model/provider
+        so provider_config_ok is True on the real server."""
+        server = BridgeHttpServer(
+            "codex", "/tmp/lcb-nonexistent-home", "secret-key",
+            host="127.0.0.1", port=0, instance="local", mode="bridge-workspace",
+        )
+        try:
+            self.assertEqual(server.httpd._config_overrides, list(CONFIG_OVERRIDES))
+            handler = object.__new__(BridgeHttpHandler)
+            handler.server = server.httpd
+            handler.requestline = "GET /ready HTTP/1.1"
+            handler.request_version = "HTTP/1.1"
+            handler.wfile = io.BytesIO()
+            handler._handle_health()
+            raw = handler.wfile.getvalue().decode("utf-8")
+            body = json.loads(raw.split("\r\n\r\n", 1)[1])
+            self.assertTrue(body["provider_config_ok"], body)
+        finally:
+            server.httpd.server_close()
     def test_http_server_wires_instance_mode_port_onto_handler_server(self):
         server = BridgeHttpServer(
             "codex", "/tmp/lcb-nonexistent-home", "secret-key",
@@ -492,20 +580,24 @@ class HealthMetadataTest(unittest.TestCase):
         spec = yaml.safe_load(open(os.path.join(ROOT, "openapi.yaml"), encoding="utf-8"))
         self.assertEqual(spec["info"]["version"], "1.1.0")
         paths = spec["paths"]
-        self.assertEqual(len(paths), 8)
+        self.assertEqual(len(paths), 9)
         ops = []
         for item in paths.values():
             for verb in ("get", "post"):
                 if verb in item:
                     ops.append(item[verb])
-        self.assertEqual(len(ops), 8)
+        self.assertEqual(len(ops), 9)
         for op in ops:
             self.assertFalse(op.get("x-openai-isConsequential", True),
                              op.get("operationId"))
         health_props = paths["/health"]["get"]["responses"]["200"]["content"] \
             ["application/json"]["schema"]["properties"]
-        for key in ("instance", "mode", "port"):
+        for key in ("instance", "mode", "port", "provider_config_ok", "ready"):
             self.assertIn(key, health_props)
+        ready_props = paths["/ready"]["get"]["responses"]["200"]["content"] \
+            ["application/json"]["schema"]["properties"]
+        for key in ("instance", "mode", "port", "provider_config_ok", "ready"):
+            self.assertIn(key, ready_props)
 
 
 class MaintenanceScriptsTest(unittest.TestCase):
@@ -913,6 +1005,302 @@ class ActivateRollbackTest(unittest.TestCase):
             self.assertIn("rollback: activation failed", proc.stderr)
             self.assertNotIn("dummy-api-key-not-a-real-secret", combined)
             self.assertNotIn("maintenance-test.invalid", combined)
+
+
+class DeactivateRollbackTest(unittest.TestCase):
+    """Fail-safe maintenance rollback regression for
+    deactivate_maintenance_instance.sh.
+
+    Regression: when the maintenance instance was already stopped, a failed
+    local restore / local health / public health used to leave the public
+    control plane dark. The deactivate script must now fail-safe re-open the
+    maintenance window (sanctioned start path only) and verify
+    maintenance/bridge-workspace/8323 + public health; only when that
+    rollback ALSO fails is an explicit DOUBLE FAILURE reported. All dynamic
+    tests run the real script against a temp repo copy with fake
+    stop/start/curl/launchctl helpers - no real launchctl, signal or process
+    is ever touched.
+    """
+
+    @staticmethod
+    def _rollback_body(text):
+        lines = text.splitlines()
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("rollback() {"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "}")
+        return "\n".join(lines[start:end + 1])
+
+    def test_rollback_armed_before_maintenance_stop(self):
+        text = open(DEACTIVATE, encoding="utf-8").read()
+        arm_idx = text.index("ROLLBACK_ARMED=1")
+        stop_idx = text.index('BRIDGE_INSTANCE="$INSTANCE" "$ROOT/scripts/stop_ngrok_bridge.sh"')
+        self.assertLess(arm_idx, stop_idx)
+        # disarmed only after local health + identity + public health pass
+        public_idx = text.index("public health OK for the fixed endpoint (served by local again)")
+        disarm_idx = text.index("rollback disarmed: deactivation completed successfully")
+        self.assertLess(public_idx, disarm_idx)
+
+    def test_rollback_restarts_maintenance_and_verifies(self):
+        body = self._rollback_body(open(DEACTIVATE, encoding="utf-8").read())
+        self.assertIn('BRIDGE_INSTANCE="$INSTANCE" "$ROOT/scripts/start_ngrok_bridge.sh"', body)
+        self.assertIn("bridge_health_identity", body)
+        self.assertIn("maintenance window restored and verified", body)
+        self.assertIn("DOUBLE FAILURE", body)
+        # no broad kill / no unbounded removal / never hpc
+        for needle in ("pkill", "killall", "rm -rf", "rm -r ", "kill -9", "kill ",
+                       "BRIDGE_INSTANCE=hpc"):
+            self.assertNotIn(needle, body, needle)
+        # the domain value is read but never printed
+        printing = re.compile(r"\b(?:echo|printf|log|rlog|die)\b.*\$(?:DOMAIN|domain)")
+        for ln in body.splitlines():
+            self.assertNotRegex(ln, printing, "rollback prints domain content")
+
+    def test_deactivate_acquires_host_ops_lock(self):
+        text = open(DEACTIVATE, encoding="utf-8").read()
+        self.assertIn('host_ops_lock_acquire "deactivate-maintenance"', text)
+
+    # -- dynamic state-machine tests (temp repo + fake stop/start/curl) ------
+
+    def _make_fake_repo(self, d):
+        repo = os.path.join(d, "repo")
+        os.makedirs(repo)
+        for name in ("scripts", "config"):
+            shutil.copytree(os.path.join(ROOT, name), os.path.join(repo, name))
+        with open(os.path.join(repo, ".bridge_api_key"), "w") as fh:
+            fh.write("dummy-api-key-not-a-real-secret\n")
+        with open(os.path.join(repo, ".ngrok_domain"), "w") as fh:
+            fh.write("maintenance-test.invalid\n")
+        home = os.path.join(d, "home")
+        os.makedirs(os.path.join(home, ".codex-deepseek"))
+        with open(os.path.join(home, ".codex-deepseek", "config.toml"), "w") as fh:
+            fh.write('model = "test-model"\n')
+        state = os.path.join(d, "state")
+        return repo, home, state
+
+    def _install_fakes(self, repo, call_log):
+        stop = os.path.join(repo, "scripts", "stop_ngrok_bridge.sh")
+        start = os.path.join(repo, "scripts", "start_ngrok_bridge.sh")
+        with open(stop, "w") as fh:
+            fh.write('#!/usr/bin/env bash\n'
+                     'echo "${BRIDGE_INSTANCE:-<unset>} stop" >> "${FAKE_CALL_LOG:?}"\n'
+                     'RUNTIME_DIR="${BRIDGE_STATE_ROOT:?}/${BRIDGE_INSTANCE:-local}/runtime"\n'
+                     'rm -f "$RUNTIME_DIR/bridge.pid" "$RUNTIME_DIR/ngrok.pid"\n'
+                     'exit 0\n')
+        with open(start, "w") as fh:
+            fh.write('#!/usr/bin/env bash\n'
+                     'echo "${BRIDGE_INSTANCE:-<unset>} start" >> "${FAKE_CALL_LOG:?}"\n'
+                     'case " ${FAKE_FAIL_INSTANCE:-} " in\n'
+                     '  *" ${BRIDGE_INSTANCE:-local} "*) exit 1 ;;\n'
+                     'esac\n'
+                     'RUNTIME_DIR="${BRIDGE_STATE_ROOT:?}/${BRIDGE_INSTANCE:-local}/runtime"\n'
+                     'mkdir -p "$RUNTIME_DIR"\n'
+                     'echo "$$" > "$RUNTIME_DIR/bridge.pid"\n'
+                     'exit 0\n')
+        os.chmod(stop, 0o755)
+        os.chmod(start, 0o755)
+        bindir = os.path.join(repo, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(bindir, "curl"), "w") as fh:
+            fh.write('#!/usr/bin/env bash\n'
+                     'port="8321"\n'
+                     'for arg in "$@"; do\n'
+                     '  case "$arg" in\n'
+                     '    http://127.0.0.1:*) port="${arg#http://127.0.0.1:}"; port="${port%%/*}" ;;\n'
+                     '    https://*) port="public" ;;\n'
+                     '  esac\n'
+                     'done\n'
+                     'if [[ -n "${FAKE_HEALTH_FAIL:-}" && "$FAKE_HEALTH_FAIL" == "$port" '
+                     '&& ! -f "${BRIDGE_STATE_ROOT:?}/health-failed.once" ]]; then\n'
+                     '  touch "${BRIDGE_STATE_ROOT:?}/health-failed.once"\n'
+                     '  printf \'curl: (7) connection refused\\n\' >&2\n'
+                     '  exit 7\n'
+                     'fi\n'
+                     'if [[ -f "${BRIDGE_STATE_ROOT:?}/maintenance/runtime/bridge.pid" ]]; then\n'
+                     '  printf \'{"status":"ok","instance":"maintenance",'
+                     '"mode":"bridge-workspace","port":8323}\\n\'\n'
+                     '  exit 0\n'
+                     'fi\n'
+                     'if [[ -f "${BRIDGE_STATE_ROOT:?}/local/runtime/bridge.pid" ]]; then\n'
+                     '  printf \'{"status":"ok","instance":"local",'
+                     '"mode":"bridge-workspace","port":8321}\\n\'\n'
+                     '  exit 0\n'
+                     'fi\n'
+                     'printf \'curl: (7) connection refused\\n\' >&2\n'
+                     'exit 7\n')
+        with open(os.path.join(bindir, "launchctl"), "w") as fh:
+            fh.write('#!/usr/bin/env bash\n'
+                     'label="${2##*/}"\n'
+                     'plist="$HOME/Library/LaunchAgents/$label.plist"\n'
+                     'if [[ "$1" == "print" ]]; then\n'
+                     '  [[ -f "$plist" ]] && exit 0 || exit 1\n'
+                     'fi\n'
+                     'echo "launchctl $*" >> "${FAKE_CALL_LOG:?}"\n'
+                     'exit 0\n')
+        for name in ("curl", "launchctl"):
+            os.chmod(os.path.join(bindir, name), 0o755)
+
+    def _run_deactivate(self, repo, home, state, call_log, fail_instance="",
+                        health_fail="", health_wait=30):
+        env = dict(os.environ)
+        for key in ("BRIDGE_INSTANCE", "BRIDGE_STATE_ROOT", "XDG_STATE_HOME",
+                    "BRIDGE_SANDBOX_MODE", "BRIDGE_SANDBOX_MODE_FILE", "NGROK_DOMAIN",
+                    "SUPERVISOR_AGENT_LABEL", "HOST_OPS_LOCK_TOKEN"):
+            env.pop(key, None)
+        sentinel = os.path.join(state, "local", "runtime", "supervisor.enabled")
+        os.makedirs(os.path.dirname(sentinel), exist_ok=True)
+        with open(sentinel, "w") as fh:
+            fh.write("")
+        # maintenance window ACTIVE: pause marker + activation marker +
+        # maintenance runtime pid (fake curl health gate)
+        pause = os.path.join(state, "local", "pause.marker")
+        os.makedirs(os.path.dirname(pause), exist_ok=True)
+        with open(pause, "w") as fh:
+            fh.write("")
+        marker = os.path.join(state, "maintenance", "activate.marker")
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w") as fh:
+            fh.write("instance=maintenance\nsupervisor_state=enabled\n")
+        maint_runtime = os.path.join(state, "maintenance", "runtime")
+        os.makedirs(maint_runtime, exist_ok=True)
+        with open(os.path.join(maint_runtime, "bridge.pid"), "w") as fh:
+            fh.write("999999\n")
+        env.update({
+            "BRIDGE_STATE_ROOT": state,
+            "HOME": home,
+            "FAKE_CALL_LOG": call_log,
+            "FAKE_FAIL_INSTANCE": fail_instance,
+            "FAKE_HEALTH_FAIL": health_fail,
+            "DEACTIVATE_HEALTH_WAIT": str(health_wait),
+            "SUPERVISOR_AGENT_LABEL": "com.local.codex-bridge.testonly",
+            "PATH": os.path.join(repo, "bin") + os.pathsep + env.get("PATH", ""),
+        })
+        return subprocess.run(
+            ["bash", os.path.join(repo, "scripts", "deactivate_maintenance_instance.sh")],
+            capture_output=True, text=True, env=env, cwd=repo,
+        )
+
+    def _calls(self, call_log):
+        if not os.path.exists(call_log):
+            return []
+        return [ln for ln in open(call_log, encoding="utf-8").read().splitlines() if ln]
+
+    def test_dynamic_success_deactivates_without_rollback(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            proc = self._run_deactivate(repo, home, state, call_log)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(self._calls(call_log),
+                             ["maintenance stop", "local start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("maintenance window CLOSED", proc.stdout)
+            self.assertIn("rollback disarmed", proc.stdout)
+            self.assertNotIn("DOUBLE FAILURE", combined)
+            self.assertNotIn("rollback: local restore/health failed", proc.stderr)
+            # markers cleared, lock released
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "maintenance", "activate.marker")))
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "local", "pause.marker")))
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "host-ops.lock")))
+            self.assertNotIn("dummy-api-key-not-a-real-secret", combined)
+            self.assertNotIn("maintenance-test.invalid", combined)
+
+    def test_dynamic_local_start_failure_rolls_back_to_maintenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            proc = self._run_deactivate(repo, home, state, call_log,
+                                        fail_instance="local")
+            self.assertNotEqual(proc.returncode, 0)
+            calls = self._calls(call_log)
+            # maintenance stop -> local start FAILS -> fail-safe maintenance
+            # start + verification (no local start retry, no broad kill)
+            self.assertEqual(
+                calls, ["maintenance stop", "local start", "maintenance start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("local start failed", combined)
+            self.assertIn("rollback: local restore/health failed", proc.stderr)
+            self.assertIn("maintenance window restored and verified", proc.stderr)
+            self.assertNotIn("DOUBLE FAILURE", combined)
+            # the window is ACTIVE again: pause + activation markers back,
+            # maintenance runtime pid present, lock released
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "local", "pause.marker")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "maintenance", "activate.marker")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "maintenance", "runtime", "bridge.pid")))
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "host-ops.lock")))
+            self.assertNotIn("dummy-api-key-not-a-real-secret", combined)
+            self.assertNotIn("maintenance-test.invalid", combined)
+
+    def test_dynamic_local_health_failure_rolls_back_to_maintenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            proc = self._run_deactivate(repo, home, state, call_log,
+                                        health_fail="8321", health_wait=1)
+            self.assertNotEqual(proc.returncode, 0)
+            calls = self._calls(call_log)
+            self.assertEqual(
+                calls, ["maintenance stop", "local start", "maintenance start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("local health did not become OK", combined)
+            self.assertIn("maintenance window restored and verified", proc.stderr)
+            self.assertNotIn("DOUBLE FAILURE", combined)
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "maintenance", "runtime", "bridge.pid")))
+
+    def test_dynamic_public_health_failure_rolls_back_to_maintenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            proc = self._run_deactivate(repo, home, state, call_log,
+                                        health_fail="public")
+            self.assertNotEqual(proc.returncode, 0)
+            calls = self._calls(call_log)
+            self.assertEqual(
+                calls, ["maintenance stop", "local start", "maintenance start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("public health did not become OK", combined)
+            self.assertIn("maintenance window restored and verified", proc.stderr)
+            self.assertNotIn("DOUBLE FAILURE", combined)
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "maintenance", "runtime", "bridge.pid")))
+
+    def test_dynamic_dual_failure_when_rollback_also_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            proc = self._run_deactivate(repo, home, state, call_log,
+                                        fail_instance="local maintenance")
+            self.assertNotEqual(proc.returncode, 0)
+            calls = self._calls(call_log)
+            self.assertEqual(
+                calls, ["maintenance stop", "local start", "maintenance start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("DOUBLE FAILURE", proc.stderr)
+            self.assertNotIn("maintenance window restored and verified", combined)
+            # maintenance never came back up (rollback start failed too)
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "maintenance", "runtime", "bridge.pid")))
 
 
 if __name__ == "__main__":

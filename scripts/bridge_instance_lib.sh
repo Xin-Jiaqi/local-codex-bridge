@@ -250,3 +250,27 @@ ok = d.get("status") == "ok" and d.get("instance") == sys.argv[1] \
      and d.get("mode") == sys.argv[2] and d.get("port") == int(sys.argv[3])
 sys.exit(0 if ok else 1)' "$expect_instance" "$expect_mode" "$expect_port" <<<"$body"
 }
+
+# Returns 0 when GET $url/ready reports readiness == true (the HTTP server
+# answers 200 only when the app-server is alive AND the provider secret
+# reference is readable AND the model/provider config is complete). This is
+# the supervisor's real readiness gate (a bare HTTP 200 is never enough).
+# No body/domain content is printed.
+bridge_health_ready() {
+  local url="$1" logf="$2" body rc
+  body="$(curl -fsS -m 15 "$url/ready" 2>>"$logf")" || return 1
+  rc=0
+  python3 -c 'import json,sys
+try:
+    d = json.loads(sys.stdin.read())
+    sys.exit(0 if d.get("ready") is True else 1)
+except Exception:
+    sys.exit(1)' <<<"$body" || rc=1
+  return "$rc"
+}
+
+# Prints the recorded public tunnel URL file for an instance (written by
+# start_ngrok_bridge.sh; value is never printed by callers).
+bridge_public_url_file() {
+  printf '%s/public_url' "$(bridge_instance_dir "$1")"
+}

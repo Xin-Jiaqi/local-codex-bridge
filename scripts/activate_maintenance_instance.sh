@@ -67,6 +67,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/bridge_instance_lib.sh"
 . "$ROOT/scripts/pid_guard_lib.sh"
 . "$ROOT/scripts/supervisor_control.sh"
+. "$ROOT/scripts/host_ops_lock_lib.sh"
 
 log() { printf '[activate-maintenance] %s\n' "$*"; }
 rlog() { printf '[activate-maintenance] rollback: %s\n' "$*" >&2; }
@@ -163,6 +164,13 @@ on_error() {
   rollback
   exit "${rc:-1}"
 }
+
+# Global single-writer host-ops lock: only one control-plane mutation runs
+# at a time (humans / ChatGPT / unattended automation). BUSY when another
+# host op holds the lock; sub-scripts called from this parent re-enter via
+# the exported token; released automatically on EXIT.
+host_ops_lock_acquire "activate-maintenance" || die \
+  "another host operation holds the host-ops lock; concurrent control-plane writes are refused (retry after it exits; run ./scripts/status_launch_agent.sh --instance local to inspect)"
 
 INSTANCE="maintenance"
 SOURCE_HOME="$HOME/.codex-deepseek"

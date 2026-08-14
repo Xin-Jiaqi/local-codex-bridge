@@ -76,6 +76,8 @@ def fixture(d, scenario):
     os.chmod(cmd_copy, 0o755)
     shutil.copy2(os.path.join(ROOT, "scripts", "bridge_instance_lib.sh"),
                  os.path.join(repo, "scripts", "bridge_instance_lib.sh"))
+    shutil.copy2(os.path.join(ROOT, "scripts", "host_ops_lock_lib.sh"),
+                 os.path.join(repo, "scripts", "host_ops_lock_lib.sh"))
     with open(os.path.join(repo, ".ngrok_domain"), "w") as fh:
         fh.write(DUMMY_DOMAIN + "\n")
 
@@ -198,14 +200,15 @@ class BootstrapStaticTest(unittest.TestCase):
             text = fh.read()
         body = "\n".join(ln for ln in text.splitlines()
                          if not ln.lstrip().startswith("#"))
-        # only `bash "$ROOT/scripts/..."` invocations count as calls; plain
-        # mentions inside user-facing hint text are fine
+        # only `bash "$ROOT/scripts/..."` invocations count as calls (plus
+        # the sourced helpers); plain mentions in hint text are fine
         called = set(re.findall(r'\$ROOT/scripts/([A-Za-z0-9_.-]+\.sh)', body))
         self.assertEqual(
             called,
             {"activate_maintenance_instance.sh",
              "activate_runtime_autorecovery.sh",
-             "bridge_instance_lib.sh"},
+             "bridge_instance_lib.sh",
+             "host_ops_lock_lib.sh"},
             called)
 
     def test_no_dangerous_commands_and_no_hpc_touch(self):

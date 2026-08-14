@@ -71,7 +71,7 @@ def validate_openapi():
     spec = yaml.safe_load(open(os.path.join(ROOT, "openapi.yaml"), encoding="utf-8"))
     paths = spec.get("paths") or {}
     expected_paths = {
-        "/health", "/start", "/continue", "/observe", "/steer",
+        "/health", "/ready", "/start", "/continue", "/observe", "/steer",
         "/interrupt", "/threads", "/threads/{thread_id}",
     }
     ops = {}
@@ -81,6 +81,7 @@ def validate_openapi():
                 ops[path] = item[verb].get("operationId")
     expected_ops = {
         "/health": "codexHealth",
+        "/ready": "codexReady",
         "/start": "codexStart",
         "/continue": "codexContinue",
         "/observe": "codexObserve",
@@ -110,9 +111,10 @@ def validate_openapi():
     if spec.get("security") != [{"bearerAuth": []}]:
         ok = False
         problems.append("global security missing")
-    if paths["/health"].get("get", {}).get("security") != []:
-        ok = False
-        problems.append("/health security override missing")
+    for probe in ("/health", "/ready"):
+        if paths[probe].get("get", {}).get("security") != []:
+            ok = False
+            problems.append("%s security override missing" % probe)
     observe_schema = (
         paths["/observe"]["post"]["requestBody"]["content"]["application/json"]["schema"]
     )
@@ -165,16 +167,29 @@ def main():
         BASE = "http://127.0.0.1:%d" % server.port
         log.info("http base=%s (api_key configured)" % BASE)
 
-        # ---- 1. health (no auth)
+        # ---- 1. health + /ready: real readiness gate (no auth)
         try:
             st, body = http("GET", "/health")
             ok = st == 200 and body.get("status") == "ok" \
+                and body.get("ready") is True \
                 and body.get("app_server_alive") is True \
+                and body.get("provider_secret") is True \
+                and body.get("provider_config_ok") is True \
                 and body.get("model") == "deepseek-chat" \
                 and body.get("model_provider") == "deepseek"
             scenario("health", ok, "status=%s body=%r" % (st, body))
         except Exception as e:
             scenario("health", False, "exception: %r" % e)
+
+        # ---- 1b. /ready (same non-sensitive readiness payload, no auth)
+        try:
+            st_r, body_r = http("GET", "/ready")
+            ok_r = st_r == 200 and body_r.get("ready") is True \
+                and body_r.get("status") == "ok" \
+                and body_r.get("provider_secret") is True
+            scenario("ready", ok_r, "status=%s body=%r" % (st_r, body_r))
+        except Exception as e:
+            scenario("ready", False, "exception: %r" % e)
 
         # ---- 2. bearer auth
         try:
@@ -337,12 +352,12 @@ def main():
         except Exception as e:
             log.info("stop error: %r" % e)
         log.info("=== SUMMARY ===")
-        for name in ("health", "auth", "start", "observe", "continue",
+        for name in ("health", "ready", "auth", "start", "observe", "continue",
                      "list", "list_limit", "read", "observe_clamp", "interrupt",
                      "errors", "openapi"):
             ok, detail = results.get(name, (False, "not run"))
             log.info("  %s: %s" % (name, "PASS" if ok else "FAIL"))
-        all_ok = all(ok for ok, _ in results.values()) and len(results) == 12
+        all_ok = all(ok for ok, _ in results.values()) and len(results) == 13
         log.info("RESULT: %s" % ("PASS" if all_ok else "FAIL"))
         log.close()
         return 0 if all_ok else 1

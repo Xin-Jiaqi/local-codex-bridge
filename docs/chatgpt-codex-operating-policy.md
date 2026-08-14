@@ -1,6 +1,11 @@
 # ChatGPT ↔ Codex Operating Policy
 
-> 版本：1.1 · 日期：2026-08-13 · 类型：Custom GPT Instructions 的仓库版本化副本
+> 版本：1.2 · 日期：2026-08-14 · 类型：Custom GPT Instructions 的仓库版本化副本
+
+> 1.2 变更：新增 Host-ops single-writer lock 协议（2026-08-14 实机发现两个
+> ChatGPT/自动化会话同时操作同一控制面，暴露缺少 single-writer ownership；
+> 控制面入口现以全局 host-ops lock 串行化，记录 2026-08-14 三个回归的修复
+> 与验证口径）。
 
 > 1.1 变更：强化 Long-running task completion protocol——在线时必须持续
 > observe 到终态；硬限制下显式 `PENDING`；配置了本机 unattended monitor 的
@@ -16,6 +21,28 @@ GPT Builder。若两者不一致，以 GPT Builder 中的实际 Instructions 为
 - ChatGPT = planner / reasoner / reviewer。
 - Codex = local executor：本机事实获取、精确文件修改、shell、测试、调试、
   git/gh、runtime 验证。
+
+## Host-ops single-writer lock
+
+- 控制面入口（activate/deactivate maintenance、
+  `activate_runtime_autorecovery.sh`、`bootstrap_autorecovery.command`）是
+  **single-writer**：同一时间只允许一个 host-op 写 instance state /
+  endpoint。全局锁实现在 `scripts/host_ops_lock_lib.sh`（state root 下固定
+  `host-ops.lock` 目录，`mkdir` 原子获取，记录 pid/operation/token/epoch，
+  不记录 secret）。
+- 并发宿主操作（另一 ChatGPT 会话 / unattended automation）必须得到
+  `BUSY` 并**立即停止写入**，不做重试循环；先查 `status_launch_agent.sh` /
+  /health 确认当前 owner，等其退出后再继续。
+- 同一父操作（如 bootstrap 编排调用 activate/autorecovery/deactivate）通过
+  导出的 token 可重入，不重复持锁；锁在 EXIT 自动释放，owner pid 已死时
+  允许一次 stale cleanup。
+- 2026-08-14 实机发现并修复的三个控制面回归：`/health` 因
+  `_config_overrides` 缺失持续 500；stable runtime 漏装
+  `config/bridge-workspace.example.toml`；deactivate 在 local 恢复失败时无
+  fail-safe（现自动 rollback 回 maintenance，仅双重失败才报错）。全部有
+  离线回归测试，v1.1.0 仍未发布。
+- 普通 task API（/start、/continue、/observe、/threads …）不获得任何
+  host-op 能力；lock 只属于 host-admin 控制面入口。
 
 ## Principles
 

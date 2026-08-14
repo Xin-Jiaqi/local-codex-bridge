@@ -28,7 +28,8 @@ jobs:
             tests/test_pid_guard.py \
             tests/test_runtime_supervisor.py \
             tests/test_activate_runtime_autorecovery.py \
-            tests/test_bootstrap_autorecovery_command.py; do
+            tests/test_bootstrap_autorecovery_command.py \
+            tests/test_host_ops_lock.py; do
             python3 "$t"
           done
       - name: py_compile

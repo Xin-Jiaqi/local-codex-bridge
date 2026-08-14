@@ -13,6 +13,41 @@
 > 全部未发布工作统一归档到 1.1.0，避免把 post-release 修复伪装成 v1.0.0
 > 内容，也不虚构 1.0.1 已发布。
 
+### 维护期集中修复（2026-08-14，maintenance instance 内完成，未发布）
+
+- **回归 1（真实故障）：`/health` 持续 500**。`_BridgeHTTPServer` 缺少
+  `_config_overrides`，readiness 读取该属性时抛 AttributeError 返回 500。
+  已保留并正式化 `self.httpd._config_overrides = self._config_overrides`
+  wiring，并新增**真实** `BridgeHttpServer` 回归测试（断言
+  `provider_config_ok`，避免 fake server 掩盖）；`/health` + `/ready` 统一
+  为真实 readiness gate（app-server 存活 + provider secret 引用可读 +
+  model/provider config 完整，三者齐备才 200）；openapi.yaml 同步为 9 个
+  operation。
+- **回归 2：stable runtime 漏 `config/`**。`install_runtime.sh` 的 tracked
+  allowlist 纳入 `config/`（`config/bridge-workspace.example.toml`——真实
+  runtime start 依赖的 bridge-workspace profile 示例）；新增
+  installed-runtime dependency 测试：实际临时安装后必须包含该文件，且仍
+  不含 `.git`/tests/docs/secrets/domain。
+- **回归 3：deactivate 无 fail-safe**。`deactivate_maintenance_instance.sh`
+  在 maintenance 已停、local 恢复失败时直接退出，公网控制面掉线。现在自
+  maintenance stop 起武装 fail-safe rollback：local 恢复/本地 health/
+  identity/公网 health 任一步失败 → 自动重新启动 maintenance 并验证
+  maintenance/bridge-workspace/8323 + 公网 health；只有 rollback 也失败才
+  报明确 DOUBLE FAILURE。无 broad kill（managed start path only）。
+- **single-writer host-ops lock**：新增 `scripts/host_ops_lock_lib.sh`——
+  state root 下固定 `host-ops.lock` 目录，`mkdir` 原子获取；记录
+  pid/operation/token/epoch（不含 secret）；同一父操作经导出 token 可重入；
+  其他并发操作返回 BUSY；owner pid 已死时允许一次安全 stale cleanup；
+  EXIT trap 自动释放。接入 activate maintenance、deactivate maintenance、
+  activate_runtime_autorecovery、bootstrap_autorecovery.command，避免
+  ChatGPT/自动化并发写同一控制面；普通 task API 不获得任何 host-op 能力。
+- 测试：新增 `tests/test_host_ops_lock.py`（11 项：BUSY/reentrant/stale/
+  release/trap/无 secret 记录）；`DeactivateRollbackTest` 8 项（成功、local
+  start 失败→rollback、本地 health 失败→rollback、公网 health 失败→rollback、
+  rollback 也失败→DOUBLE FAILURE）；health 回归 3 项（真实 server wiring +
+  readiness）；installed-runtime config 依赖 1 项。全部 tmp/fake，不真
+  launchctl、不 kill 真实进程。测试总量 248 = 244 通过 + 4 跳过。
+
 ### 运行时自动恢复：runtime + supervisor + per-instance LaunchAgent（2026-08-13）
 - 新增 `scripts/install_runtime.sh` / `scripts/uninstall_runtime.sh`：稳定
   runtime 装到 `${XDG_DATA_HOME:-$HOME/.local/share}/local-codex-bridge/`

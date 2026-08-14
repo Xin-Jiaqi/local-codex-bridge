@@ -106,6 +106,7 @@ def env_for(state, data=None, config=None, home=None, **extra):
         "SUPERVISOR_AGENT_LABEL": "com.local.codex-bridge.testonly",
         "SUPERVISOR_POLL_SECS": "1",
         "SUPERVISOR_BACKOFF_SECS": "0",
+        "SUPERVISOR_RESTART_BACKOFF_SECS": "2",
     })
     if data:
         env["BRIDGE_DATA_ROOT"] = data
@@ -154,60 +155,34 @@ def install_fakes(repo, call_log, fail_start=False):
     stop = os.path.join(repo, "scripts", "stop_ngrok_bridge.sh")
     start = os.path.join(repo, "scripts", "start_ngrok_bridge.sh")
     with open(stop, "w") as fh:
-        fh.write('#!/usr/bin/env bash\n'
-                 'echo "${BRIDGE_INSTANCE:-<unset>} stop" >> "${FAKE_CALL_LOG:?}"\n'
-                 'RUNTIME_DIR="${BRIDGE_STATE_ROOT}/local/runtime"\n'
-                 'for f in bridge.pid ngrok.pid; do\n'
-                 '  pid="$(cat "$RUNTIME_DIR/$f" 2>/dev/null || true)"\n'
-                 '  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then\n'
-                 '    kill "$pid" 2>/dev/null || true\n'
-                 '  fi\n'
-                 '  rm -f "$RUNTIME_DIR/$f"\n'
-                 'done\n'
-                 'exit 0\n')
+        fh.write('#!/usr/bin/env bash\necho "${BRIDGE_INSTANCE:-<unset>} stop" >> "${FAKE_CALL_LOG:?}"\nRUNTIME_DIR="${BRIDGE_STATE_ROOT}/local/runtime"\nfor f in bridge.pid ngrok.pid; do\n  pid="$(cat "$RUNTIME_DIR/$f" 2>/dev/null || true)"\n  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then\n    kill "$pid" 2>/dev/null || true\n  fi\n  rm -f "$RUNTIME_DIR/$f"\ndone\nexit 0\n')
     with open(start, "w") as fh:
-        fh.write('#!/usr/bin/env bash\n'
-                 'echo "${BRIDGE_INSTANCE:-<unset>} start" >> "${FAKE_CALL_LOG:?}"\n'
-                 'if [[ -n "${FAKE_FAIL_START:-}" ]]; then\n'
-                 '  exit 1\n'
-                 'fi\n'
-                 'RUNTIME_DIR="${BRIDGE_STATE_ROOT}/local/runtime"\n'
-                 'mkdir -p "$RUNTIME_DIR"\n'
-                 'bpid="$(cat "$RUNTIME_DIR/bridge.pid" 2>/dev/null || true)"\n'
-                 'if [[ -z "$bpid" ]] || ! kill -0 "$bpid" 2>/dev/null; then\n'
-                 '  nohup python3 -c \'import time; time.sleep(600)\' http_server \\\n'
-                 '    --log "$RUNTIME_DIR/bridge.log" >/dev/null 2>&1 &\n'
-                 '  echo $! > "$RUNTIME_DIR/bridge.pid"\n'
-                 'fi\n'
-                 'npid="$(cat "$RUNTIME_DIR/ngrok.pid" 2>/dev/null || true)"\n'
-                 'if [[ -z "$npid" ]] || ! kill -0 "$npid" 2>/dev/null; then\n'
-                 '  nohup python3 -c \'import time; time.sleep(600)\' ngrok \\\n'
-                 '    http 8321 >/dev/null 2>&1 &\n'
-                 '  echo $! > "$RUNTIME_DIR/ngrok.pid"\n'
-                 'fi\n'
-                 'exit 0\n')
+        fh.write('#!/usr/bin/env bash\necho "${BRIDGE_INSTANCE:-<unset>} start" >> "${FAKE_CALL_LOG:?}"\nif [[ -n "${FAKE_FAIL_START:-}" ]]; then\n  exit 1\nfi\nRUNTIME_DIR="${BRIDGE_STATE_ROOT}/local/runtime"\nmkdir -p "$RUNTIME_DIR"\nbpid="$(cat "$RUNTIME_DIR/bridge.pid" 2>/dev/null || true)"\nif [[ -z "$bpid" ]] || ! kill -0 "$bpid" 2>/dev/null; then\n  nohup python3 -c \'import time; time.sleep(600)\' http_server     --log "$RUNTIME_DIR/bridge.log" >/dev/null 2>&1 &\n  echo $! > "$RUNTIME_DIR/bridge.pid"\nfi\nnpid="$(cat "$RUNTIME_DIR/ngrok.pid" 2>/dev/null || true)"\nif [[ -z "$npid" ]] || ! kill -0 "$npid" 2>/dev/null; then\n  nohup python3 -c \'import time; time.sleep(600)\' ngrok     http 8321 >/dev/null 2>&1 &\n  echo $! > "$RUNTIME_DIR/ngrok.pid"\nfi\nmkdir -p "${BRIDGE_STATE_ROOT}/local"\nprintf \'https://runtime-test.invalid\' > "${BRIDGE_STATE_ROOT}/local/public_url"\nexit 0\n')
     bindir = os.path.join(repo, "bin")
     os.makedirs(bindir, exist_ok=True)
     with open(os.path.join(bindir, "launchctl"), "w") as fh:
+        fh.write('#!/usr/bin/env bash\ncase "$1" in\n  print) exit 1 ;;\n  *) echo "launchctl $*" >> "${FAKE_CALL_LOG:?}"; exit 0 ;;\nesac\n')
+    with open(os.path.join(bindir, "ps"), "w") as fh:
         fh.write('#!/usr/bin/env bash\n'
-                 'case "$1" in\n'
-                 '  print) exit 1 ;;\n'
-                 '  *) echo "launchctl $*" >> "${FAKE_CALL_LOG:?}"; exit 0 ;;\n'
-                 'esac\n')
-    with open(os.path.join(bindir, "curl"), "w") as fh:
-        fh.write('#!/usr/bin/env bash\n'
-                 'port="8321"\n'
-                 'for arg in "$@"; do\n'
-                 '  case "$arg" in\n'
-                 '    http://127.0.0.1:*) port="${arg#http://127.0.0.1:}"; port="${port%%/*}" ;;\n'
-                 '  esac\n'
+                 '# fake ps: identity lookup from the fake runtime pid files\n'
+                 'if [[ "${1:-}" != "-p" ]]; then exit 1; fi\n'
+                 'pid="$2"\n'
+                 'state="${BRIDGE_STATE_ROOT}/local/runtime"\n'
+                 'for name in bridge ngrok supervisor; do\n'
+                 '  f="$state/$name.pid"\n'
+                 '  if [[ -f "$f" ]] && [[ "$(cat "$f" 2>/dev/null || true)" == "$pid" ]]; then\n'
+                 '    case "$name" in\n'
+                 '      bridge) echo "python3 -c \'import time; time.sleep(600)\' http_server --log $state/bridge.log"; exit 0 ;;\n'
+                 '      ngrok) echo "/fake/bin/ngrok http 8321"; exit 0 ;;\n'
+                 '      supervisor) echo "/bin/bash $state/../scripts/run_local_supervisor.sh --instance local"; exit 0 ;;\n'
+                 '    esac\n'
+                 '  fi\n'
                  'done\n'
-                 'if [[ "$port" == "8323" ]]; then instance="maintenance"; else instance="local"; fi\n'
-                 'printf \'{"status":"ok","instance":"%s","mode":"bridge-workspace","port":%s}\\n\' \\\n'
-                 '  "$instance" "$port"\n'
-                 'exit 0\n')
+                 'exit 1\n')
+    with open(os.path.join(bindir, "curl"), "w") as fh:
+        fh.write('#!/usr/bin/env bash\nurl=""\nfor arg in "$@"; do\n  case "$arg" in\n    http://127.0.0.1:*) url="local" ;;\n    https://*) url="public" ;;\n  esac\ndone\nif [[ -z "$url" ]]; then url="local"; fi\nport="8321"\nfor arg in "$@"; do\n  case "$arg" in\n    http://127.0.0.1:*) port="${arg#http://127.0.0.1:}" ;;\n  esac\n  port="${port%%/*}"\ndone\nflag="$(cat "${FAKE_READY_FILE:-}" 2>/dev/null || echo "${FAKE_READY:-1}")"\nif [[ "$url" == "local" && "$flag" == "0" ]]; then exit 1; fi\npflag="$(cat "${FAKE_PUBLIC_READY_FILE:-}" 2>/dev/null || echo "${FAKE_PUBLIC_READY:-1}")"\nif [[ "$url" == "public" && "$pflag" == "0" ]]; then exit 1; fi\ninstance="local"\nfor arg in "$@"; do\n  case "$arg" in\n    http://127.0.0.1:8323*) instance="maintenance" ;;\n  esac\ndone\nprintf \'{"status":"ok","ready":true,"app_server_alive":true,"provider_secret":true,"provider_config_ok":true,"instance":"%s","mode":"bridge-workspace","port":%s}\\n\' "$instance" "$port"\nexit 0\n')
     for f in (stop, start, os.path.join(bindir, "curl"),
-              os.path.join(bindir, "launchctl")):
+              os.path.join(bindir, "launchctl"), os.path.join(bindir, "ps")):
         os.chmod(f, 0o755)
     subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
     subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c",
@@ -237,6 +212,17 @@ def calls(call_log):
     return [ln for ln in open(call_log, encoding="utf-8").read().splitlines() if ln]
 
 
+def sup_log_lines(state):
+    path = os.path.join(local_runtime(state), "supervisor.log")
+    if not os.path.exists(path):
+        return []
+    return open(path, encoding="utf-8").read().splitlines()
+
+
+def count_sup_lines(state, needle):
+    return len([ln for ln in sup_log_lines(state) if needle in ln])
+
+
 def read_pid(state, name):
     path = os.path.join(local_runtime(state), name + ".pid")
     if not os.path.exists(path):
@@ -246,6 +232,11 @@ def read_pid(state, name):
 
 def pid_alive(pid):
     if not pid or not re.match(r"^\d+$", str(pid)):
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
         return False
 
 
@@ -260,11 +251,6 @@ def ps_available():
 
 def repo_script(repo, name):
     return os.path.join(repo, "scripts", name)
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except OSError:
-        return False
 
 
 class RuntimeInstallTest(unittest.TestCase):
@@ -303,6 +289,7 @@ class RuntimeInstallTest(unittest.TestCase):
                         release_dir)
         # allowlisted runtime files present
         for rel in ("bridge/__init__.py", "http_server/server.py",
+                    "config/bridge-workspace.example.toml",
                     "scripts/start_ngrok_bridge.sh",
                     "scripts/run_local_supervisor.sh",
                     "scripts/supervisor_control.sh",
@@ -321,6 +308,36 @@ class RuntimeInstallTest(unittest.TestCase):
         # supervisor script is executable
         self.assertTrue(os.access(os.path.join(current, "scripts",
                                                "run_local_supervisor.sh"), os.X_OK))
+
+    def test_install_runtime_requires_config_example(self):
+        """Regression: a real temp install must ship
+        config/bridge-workspace.example.toml (the stable runtime start flow
+        depends on the workspace profile example) and still exclude
+        .git/tests/docs/secrets."""
+        d, repo, state, data, config, home = self._make()
+        proc = self._install(repo, state, data, config, home)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        current = os.path.join(data, "current")
+        self.assertTrue(os.path.islink(current), current)
+        example = os.path.join(current, "config", "bridge-workspace.example.toml")
+        self.assertTrue(os.path.isfile(example), example)
+        self.assertIn("bridge-workspace", open(example, encoding="utf-8").read())
+        for rel in (".git", "tests", "docs", ".bridge_api_key", ".ngrok_domain",
+                    ".public_url", "openapi.yaml", "CHANGELOG.md"):
+            self.assertFalse(os.path.exists(os.path.join(current, rel)), rel)
+        # secret/domain content never leaks into the installed REAL files
+        # (scripts/ holds test fakes that intentionally mention the dummy
+        # domain; bridge/http_server/config are the real repo artifacts)
+        for root, _, files in os.walk(current):
+            rel_root = os.path.relpath(root, current)
+            if rel_root not in (".", "bridge", "http_server", "config"):
+                continue
+            for name in files:
+                path = os.path.join(root, name)
+                if name.endswith((".py", ".sh", ".toml", ".md", ".json")):
+                    data_bytes = open(path, "rb").read()
+                    self.assertNotIn(DUMMY_KEY.encode(), data_bytes, path)
+                    self.assertNotIn(DUMMY_DOMAIN.encode(), data_bytes, path)
 
     def test_install_manifest_secret_free(self):
         d, repo, state, data, config, home = self._make()
@@ -645,8 +662,10 @@ class SupervisorControlTest(unittest.TestCase):
         self.call_log = os.path.join(self.d, "calls.log")
         install_fakes(self.repo, self.call_log)
         self.state = os.path.join(self.d, "state")
+        self.data = os.path.join(self.d, "data")
+        self.config = os.path.join(self.d, "config")
         run_admin(["create", "local"], self.state)
-        self.env = env_for(self.state)
+        self.env = env_for(self.state, self.data, self.config)
         self.env["FAKE_CALL_LOG"] = self.call_log
         self.env["PATH"] = os.path.join(self.repo, "bin") + os.pathsep + \
             self.env.get("PATH", "")
@@ -707,12 +726,6 @@ class SupervisorRuntimeTest(unittest.TestCase):
              "--instance", "local"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=self.repo)
-
-    def setUp(self):
-        super().setUp()
-        if not ps_available():
-            self.skipTest("ps is unavailable in this sandbox; live supervisor "
-                          "identity checks cannot run (CI has ps)")
 
     def test_refuses_hpc_maintenance_and_legacy(self):
         for inst in ("hpc", "maintenance"):
@@ -819,6 +832,95 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
                 proc.wait(timeout=15)
 
+    def test_supervisor_recovers_local_readiness_failure_without_storm(self):
+        ready_file = os.path.join(self.d, "ready.flag")
+        with open(ready_file, "w") as fh:
+            fh.write("0")
+        with open(sentinel(self.state), "w") as fh:
+            fh.write("")
+        proc = self._spawn({"FAKE_READY_FILE": ready_file})
+        try:
+            self.assertTrue(wait_for(
+                lambda: pid_alive(read_pid(self.state, "bridge")) and
+                pid_alive(read_pid(self.state, "ngrok")), timeout=15),
+                "children up despite readiness failure")
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "recovery start: local readiness failure") >= 1,
+                timeout=20), "readiness failure triggers a full recovery")
+            self.assertTrue(pid_alive(read_pid(self.state, "bridge")),
+                            "children stay up after recovery")
+            with open(ready_file, "w") as fh:
+                fh.write("1")
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "recovery complete: local readiness failure") >= 1,
+                timeout=20), "recovery completes once readiness returns")
+            time.sleep(2)
+            self.assertLessEqual(
+                count_sup_lines(self.state, "recovery start: local readiness failure"), 2,
+                "repeated readiness failures must be backoff-bounded (no storm)")
+        finally:
+            if proc.poll() is None:
+                os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
+                proc.wait(timeout=15)
+
+    def test_supervisor_public_health_threshold_and_backoff(self):
+        ready_file = os.path.join(self.d, "pub.flag")
+        with open(ready_file, "w") as fh:
+            fh.write("0")
+        with open(sentinel(self.state), "w") as fh:
+            fh.write("")
+        proc = self._spawn({"FAKE_PUBLIC_READY_FILE": ready_file,
+                            "SUPERVISOR_RESTART_BACKOFF_SECS": "60"})
+        try:
+            self.assertTrue(wait_for(
+                lambda: pid_alive(read_pid(self.state, "bridge")) and
+                pid_alive(read_pid(self.state, "ngrok")), timeout=15),
+                "children up")
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "public tunnel health failed (2/2)") >= 1,
+                timeout=20), "two consecutive public failures must reach the threshold")
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "recovery start: public tunnel health degraded") >= 1,
+                timeout=20), "threshold triggers a managed ngrok/bridge recovery")
+            time.sleep(4)
+            starts = count_sup_lines(self.state,
+                                     "recovery start: public tunnel health degraded")
+            suppressed = count_sup_lines(self.state,
+                                         "recovery suppressed: restart backoff active")
+            self.assertEqual(starts, 1, "exactly one recovery while backoff is active")
+            self.assertGreaterEqual(suppressed, 1,
+                                    "further failures are suppressed by the restart backoff")
+        finally:
+            if proc.poll() is None:
+                os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
+                proc.wait(timeout=15)
+
+    def test_supervisor_public_health_recovers_after_restore(self):
+        ready_file = os.path.join(self.d, "pub2.flag")
+        with open(ready_file, "w") as fh:
+            fh.write("0")
+        with open(sentinel(self.state), "w") as fh:
+            fh.write("")
+        proc = self._spawn({"FAKE_PUBLIC_READY_FILE": ready_file})
+        fails_file = os.path.join(local_runtime(self.state), "public_health.fails")
+        try:
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "public tunnel health failed (2/2)") >= 1,
+                timeout=20), "public failure reaches the threshold")
+            with open(ready_file, "w") as fh:
+                fh.write("1")
+            self.assertTrue(wait_for(
+                lambda: os.path.exists(fails_file) and
+                open(fails_file, encoding="utf-8").read().strip() == "0",
+                timeout=20), "healthy polls reset the public failure counter")
+            self.assertTrue(pid_alive(read_pid(self.state, "bridge")),
+                            "bridge stays up after public recovery")
+            self.assertIsNone(proc.poll(), "supervisor stays up after public recovery")
+        finally:
+            if proc.poll() is None:
+                os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
+                proc.wait(timeout=15)
+
     def test_pause_marker_stops_children_and_waits_then_resumes(self):
         with open(sentinel(self.state), "w") as fh:
             fh.write("")
@@ -912,8 +1014,9 @@ class SupervisorRuntimeTest(unittest.TestCase):
         env["BRIDGE_STATE_ROOT"] = state
         env["HOME"] = home
         env["FAKE_CALL_LOG"] = call_log
-        # repo/bin and the repo itself are NOT on PATH (no Desktop dependency)
-        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        # the fake tools dir is on PATH (hermetic ps/curl/launchctl); the
+        # Desktop repo itself stays OFF PATH (no Desktop dependency)
+        env["PATH"] = os.path.join(repo, "bin") + os.pathsep + "/usr/bin:/bin:/usr/sbin:/sbin"
         runner = subprocess.Popen(
             ["bash", supervisor_copy, "--instance", "local"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

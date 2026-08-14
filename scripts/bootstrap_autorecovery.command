@@ -28,6 +28,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/bridge_instance_lib.sh"
+. "$ROOT/scripts/host_ops_lock_lib.sh"
 
 BOOT_LOG="$ROOT/.runtime/bootstrap.log"
 
@@ -83,6 +84,12 @@ current_instance() {
 }
 
 main() {
+  # Global single-writer host-ops lock: this bootstrap orchestration must
+  # never run concurrently with another control-plane mutation. The nested
+  # activate/deactivate/autorecovery calls re-enter via the exported token;
+  # released automatically on EXIT.
+  host_ops_lock_acquire "bootstrap-autorecovery" || die \
+    "another host operation holds the host-ops lock; concurrent control-plane writes are refused (retry after it exits)"
   mkdir -p "$(dirname "$BOOT_LOG")"
   local current=""
   current="$(current_instance)"

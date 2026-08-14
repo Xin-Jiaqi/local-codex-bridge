@@ -1114,6 +1114,22 @@ class DeactivateRollbackTest(unittest.TestCase):
                      '  printf \'curl: (7) connection refused\\n\' >&2\n'
                      '  exit 7\n'
                      'fi\n'
+                     '# bounded propagation delay: file holds the remaining\n'
+                     '# failure count for this port (decremented per call)\n'
+                     'dfile=""\n'
+                     'case "$port" in\n'
+                     '  public) dfile="${FAKE_HEALTH_DELAY_PUBLIC_FILE:-}" ;;\n'
+                     '  8321) dfile="${FAKE_HEALTH_DELAY_LOCAL_FILE:-}" ;;\n'
+                     '  8323) dfile="${FAKE_HEALTH_DELAY_MAINT_FILE:-}" ;;\n'
+                     'esac\n'
+                     'if [[ -n "$dfile" && -f "$dfile" ]]; then\n'
+                     '  n="$(cat "$dfile" 2>/dev/null || echo 0)"\n'
+                     '  if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then\n'
+                     '    echo $((n - 1)) > "$dfile"\n'
+                     '    printf \'curl: (7) connection refused\\n\' >&2\n'
+                     '    exit 7\n'
+                     '  fi\n'
+                     'fi\n'
                      'if [[ -f "${BRIDGE_STATE_ROOT:?}/maintenance/runtime/bridge.pid" ]]; then\n'
                      '  printf \'{"status":"ok","instance":"maintenance",'
                      '"mode":"bridge-workspace","port":8323}\\n\'\n'
@@ -1139,7 +1155,7 @@ class DeactivateRollbackTest(unittest.TestCase):
             os.chmod(os.path.join(bindir, name), 0o755)
 
     def _run_deactivate(self, repo, home, state, call_log, fail_instance="",
-                        health_fail="", health_wait=30):
+                        health_fail="", health_wait=30, extra_env=None):
         env = dict(os.environ)
         for key in ("BRIDGE_INSTANCE", "BRIDGE_STATE_ROOT", "XDG_STATE_HOME",
                     "BRIDGE_SANDBOX_MODE", "BRIDGE_SANDBOX_MODE_FILE", "NGROK_DOMAIN",
@@ -1170,9 +1186,18 @@ class DeactivateRollbackTest(unittest.TestCase):
             "FAKE_FAIL_INSTANCE": fail_instance,
             "FAKE_HEALTH_FAIL": health_fail,
             "DEACTIVATE_HEALTH_WAIT": str(health_wait),
+            # small bounded propagation budgets keep the state-machine tests
+            # fast while still exercising real bounded polling
+            "DEACTIVATE_PUBLIC_PROPAGATION_SECS": "2",
+            "DEACTIVATE_PUBLIC_PROPAGATION_POLL": "1",
+            "DEACTIVATE_ROLLBACK_HEALTH_WAIT": "2",
+            "DEACTIVATE_ROLLBACK_PUBLIC_PROPAGATION_SECS": "3",
+            "DEACTIVATE_ROLLBACK_PUBLIC_PROPAGATION_POLL": "1",
             "SUPERVISOR_AGENT_LABEL": "com.local.codex-bridge.testonly",
             "PATH": os.path.join(repo, "bin") + os.pathsep + env.get("PATH", ""),
         })
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             ["bash", os.path.join(repo, "scripts", "deactivate_maintenance_instance.sh")],
             capture_output=True, text=True, env=env, cwd=repo,
@@ -1220,10 +1245,12 @@ class DeactivateRollbackTest(unittest.TestCase):
                                         fail_instance="local")
             self.assertNotEqual(proc.returncode, 0)
             calls = self._calls(call_log)
-            # maintenance stop -> local start FAILS -> fail-safe maintenance
-            # start + verification (no local start retry, no broad kill)
+            # maintenance stop -> local start FAILS -> fail-safe rollback
+            # re-raises the pause, stops any local children, then starts
+            # maintenance + verification (no local start retry, no broad kill)
             self.assertEqual(
-                calls, ["maintenance stop", "local start", "maintenance start"])
+                calls, ["maintenance stop", "local start", "local stop",
+                        "maintenance start"])
             combined = proc.stdout + proc.stderr
             self.assertIn("local start failed", combined)
             self.assertIn("rollback: local restore/health failed", proc.stderr)
@@ -1254,7 +1281,8 @@ class DeactivateRollbackTest(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             calls = self._calls(call_log)
             self.assertEqual(
-                calls, ["maintenance stop", "local start", "maintenance start"])
+                calls, ["maintenance stop", "local start", "local stop",
+                        "maintenance start"])
             combined = proc.stdout + proc.stderr
             self.assertIn("local health did not become OK", combined)
             self.assertIn("maintenance window restored and verified", proc.stderr)
@@ -1262,23 +1290,68 @@ class DeactivateRollbackTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(
                 os.path.join(state, "maintenance", "runtime", "bridge.pid")))
 
-    def test_dynamic_public_health_failure_rolls_back_to_maintenance(self):
+    def test_dynamic_public_delayed_success_no_rollback(self):
+        # Bounded propagation grace: the fixed public endpoint is a few
+        # seconds behind local health -> deactivation must WAIT, not rollback.
         with tempfile.TemporaryDirectory() as d:
             repo, home, state = self._make_fake_repo(d)
             run_admin(["create", "local"], state)
             run_admin(["create", "maintenance"], state)
             call_log = os.path.join(d, "calls.log")
             self._install_fakes(repo, call_log)
+            delay = os.path.join(d, "public-delay.flag")
+            with open(delay, "w") as fh:
+                fh.write("2\n")  # first two public /health calls fail
             proc = self._run_deactivate(repo, home, state, call_log,
-                                        health_fail="public")
+                                        extra_env={
+                                            "DEACTIVATE_PUBLIC_PROPAGATION_SECS": "3",
+                                            "FAKE_HEALTH_DELAY_PUBLIC_FILE": delay,
+                                        })
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(self._calls(call_log),
+                             ["maintenance stop", "local start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("maintenance window CLOSED", proc.stdout)
+            self.assertNotIn("DOUBLE FAILURE", combined)
+            self.assertNotIn("rollback: local restore/health failed", proc.stderr)
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "maintenance", "activate.marker")))
+            self.assertFalse(os.path.exists(
+                os.path.join(state, "local", "pause.marker")))
+
+    def test_dynamic_public_failure_rolls_back_with_delayed_public(self):
+        # Public endpoint stays down through the local handoff budget ->
+        # rollback re-raises the pause marker, stops local children, starts
+        # maintenance; the maintenance public endpoint is still propagating,
+        # so rollback uses ITS bounded budget and only then verifies.
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            delay = os.path.join(d, "public-delay.flag")
+            with open(delay, "w") as fh:
+                # 2 consumed by the local handoff budget (2s/poll1), the next
+                # 2 by the rollback propagation budget (3s/poll1), then OK
+                fh.write("4\n")
+            proc = self._run_deactivate(repo, home, state, call_log,
+                                        extra_env={
+                                            "FAKE_HEALTH_DELAY_PUBLIC_FILE": delay,
+                                        })
             self.assertNotEqual(proc.returncode, 0)
             calls = self._calls(call_log)
             self.assertEqual(
-                calls, ["maintenance stop", "local start", "maintenance start"])
+                calls, ["maintenance stop", "local start", "local stop",
+                        "maintenance start"])
             combined = proc.stdout + proc.stderr
             self.assertIn("public health did not become OK", combined)
             self.assertIn("maintenance window restored and verified", proc.stderr)
             self.assertNotIn("DOUBLE FAILURE", combined)
+            # the window is ACTIVE again: pause marker re-created and local
+            # children were stopped before maintenance came back up
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "local", "pause.marker")))
             self.assertTrue(os.path.isfile(
                 os.path.join(state, "maintenance", "runtime", "bridge.pid")))
 
@@ -1294,13 +1367,44 @@ class DeactivateRollbackTest(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             calls = self._calls(call_log)
             self.assertEqual(
-                calls, ["maintenance stop", "local start", "maintenance start"])
+                calls, ["maintenance stop", "local start", "local stop",
+                        "maintenance start"])
             combined = proc.stdout + proc.stderr
             self.assertIn("DOUBLE FAILURE", proc.stderr)
             self.assertNotIn("maintenance window restored and verified", combined)
             # maintenance never came back up (rollback start failed too)
             self.assertFalse(os.path.exists(
                 os.path.join(state, "maintenance", "runtime", "bridge.pid")))
+
+    def test_dynamic_rollback_public_timeout_is_double_failure(self):
+        # True timeout: public stays down through BOTH bounded budgets; only
+        # then is the explicit DOUBLE FAILURE reported (never earlier).
+        with tempfile.TemporaryDirectory() as d:
+            repo, home, state = self._make_fake_repo(d)
+            run_admin(["create", "local"], state)
+            run_admin(["create", "maintenance"], state)
+            call_log = os.path.join(d, "calls.log")
+            self._install_fakes(repo, call_log)
+            delay = os.path.join(d, "public-delay.flag")
+            with open(delay, "w") as fh:
+                fh.write("999\n")  # public never becomes ready
+            proc = self._run_deactivate(repo, home, state, call_log,
+                                        extra_env={
+                                            "FAKE_HEALTH_DELAY_PUBLIC_FILE": delay,
+                                        })
+            self.assertNotEqual(proc.returncode, 0)
+            calls = self._calls(call_log)
+            self.assertEqual(
+                calls, ["maintenance stop", "local start", "local stop",
+                        "maintenance start"])
+            combined = proc.stdout + proc.stderr
+            self.assertIn("DOUBLE FAILURE", proc.stderr)
+            self.assertNotIn("maintenance window restored and verified", combined)
+            # window state stays consistent: pause marker re-created
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "local", "pause.marker")))
+            self.assertTrue(os.path.isfile(
+                os.path.join(state, "maintenance", "activate.marker")))
 
 
 if __name__ == "__main__":

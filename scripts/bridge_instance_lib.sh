@@ -251,19 +251,20 @@ ok = d.get("status") == "ok" and d.get("instance") == sys.argv[1] \
 sys.exit(0 if ok else 1)' "$expect_instance" "$expect_mode" "$expect_port" <<<"$body"
 }
 
-# Returns 0 when GET $url/ready reports readiness == true (the HTTP server
-# answers 200 only when the app-server is alive AND the provider secret
-# reference is readable AND the model/provider config is complete). This is
-# the supervisor's real readiness gate (a bare HTTP 200 is never enough).
-# No body/domain content is printed.
+# Returns 0 when GET $url/health reports readiness == true (status=ok AND
+# ready=true; the HTTP server answers 200 only when the app-server is alive
+# AND the provider secret reference is readable AND the model/provider config
+# is complete). This is the supervisor's real readiness gate (a bare HTTP 200
+# is never enough; /ready is never queried because real instances do not
+# serve it). No body/domain content is printed.
 bridge_health_ready() {
   local url="$1" logf="$2" body rc
-  body="$(curl -fsS -m 15 "$url/ready" 2>>"$logf")" || return 1
+  body="$(curl -fsS -m 15 "$url/health" 2>>"$logf")" || return 1
   rc=0
   python3 -c 'import json,sys
 try:
     d = json.loads(sys.stdin.read())
-    sys.exit(0 if d.get("ready") is True else 1)
+    sys.exit(0 if d.get("status") == "ok" and d.get("ready") is True else 1)
 except Exception:
     sys.exit(1)' <<<"$body" || rc=1
   return "$rc"

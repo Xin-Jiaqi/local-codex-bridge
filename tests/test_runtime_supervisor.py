@@ -25,6 +25,10 @@ Covers (1.1.0 milestone):
     network failure never kills, backoff retry, TERM + sentinel-removal
     graceful stop (exit 0, children stopped, pid file removed), runs from
     the installed runtime copy without the repo (no Desktop dependency);
+    real readiness gate = GET /health JSON (status=ok, ready=true,
+    instance=local, mode=bridge-workspace, port=8321); the supervisor NEVER
+    queries /ready (404 on real instances) and a bare HTTP 200 is not
+    healthy (ready=false / wrong identity both trigger recovery);
   - maintenance cooperation: activation creates the pause marker BEFORE
     stopping local (sentinel stays; no launchd crash-loop), rollback clears
     the marker and restores the pre-window state, deactivation clears the
@@ -180,7 +184,53 @@ def install_fakes(repo, call_log, fail_start=False):
                  'done\n'
                  'exit 1\n')
     with open(os.path.join(bindir, "curl"), "w") as fh:
-        fh.write('#!/usr/bin/env bash\nurl=""\nfor arg in "$@"; do\n  case "$arg" in\n    http://127.0.0.1:*) url="local" ;;\n    https://*) url="public" ;;\n  esac\ndone\nif [[ -z "$url" ]]; then url="local"; fi\nport="8321"\nfor arg in "$@"; do\n  case "$arg" in\n    http://127.0.0.1:*) port="${arg#http://127.0.0.1:}" ;;\n  esac\n  port="${port%%/*}"\ndone\nflag="$(cat "${FAKE_READY_FILE:-}" 2>/dev/null || echo "${FAKE_READY:-1}")"\nif [[ "$url" == "local" && "$flag" == "0" ]]; then exit 1; fi\npflag="$(cat "${FAKE_PUBLIC_READY_FILE:-}" 2>/dev/null || echo "${FAKE_PUBLIC_READY:-1}")"\nif [[ "$url" == "public" && "$pflag" == "0" ]]; then exit 1; fi\ninstance="local"\nfor arg in "$@"; do\n  case "$arg" in\n    http://127.0.0.1:8323*) instance="maintenance" ;;\n  esac\ndone\nprintf \'{"status":"ok","ready":true,"app_server_alive":true,"provider_secret":true,"provider_config_ok":true,"instance":"%s","mode":"bridge-workspace","port":%s}\\n\' "$instance" "$port"\nexit 0\n')
+        fh.write('#!/usr/bin/env bash\n'
+                 '# real-machine regression: /ready does NOT exist on real\n'
+                 '# instances; only /health serves the readiness JSON.\n'
+                 'path="health"\n'
+                 'url=""\n'
+                 'for arg in "$@"; do\n'
+                 '  case "$arg" in\n'
+                 '    http://127.0.0.1:*) url="local" ;;\n'
+                 '    https://*) url="public" ;;\n'
+                 '  esac\n'
+                 '  case "$arg" in\n'
+                 '    */ready) path="ready" ;;\n'
+                 '    */health) path="health" ;;\n'
+                 '  esac\n'
+                 'done\n'
+                 'if [[ -z "$url" ]]; then url="local"; fi\n'
+                 'if [[ "$path" == "ready" ]]; then\n'
+                 '  printf "curl: (52) /ready does not exist on the real instance\\n" >&2\n'
+                 '  exit 52\n'
+                 'fi\n'
+                 'port="8321"\n'
+                 'for arg in "$@"; do\n'
+                 '  case "$arg" in\n'
+                 '    http://127.0.0.1:*) port="${arg#http://127.0.0.1:}" ;;\n'
+                 '  esac\n'
+                 '  port="${port%%/*}"\n'
+                 'done\n'
+                 'flag="$(cat "${FAKE_READY_FILE:-}" 2>/dev/null || echo "${FAKE_READY:-1}")"\n'
+                 'if [[ "$url" == "local" && "$flag" == "0" ]]; then exit 1; fi\n'
+                 'pflag="$(cat "${FAKE_PUBLIC_READY_FILE:-}" 2>/dev/null || echo "${FAKE_PUBLIC_READY:-1}")"\n'
+                 'if [[ "$url" == "public" && "$pflag" == "0" ]]; then exit 1; fi\n'
+                 'instance="local"\n'
+                 'for arg in "$@"; do\n'
+                 '  case "$arg" in\n'
+                 '    http://127.0.0.1:8323*) instance="maintenance" ;;\n'
+                 '  esac\n'
+                 'done\n'
+                 'if [[ -n "${FAKE_HEALTH_INSTANCE_FILE:-}" && -f "${FAKE_HEALTH_INSTANCE_FILE:-}" ]]; then\n'
+                 '  instance="$(cat "${FAKE_HEALTH_INSTANCE_FILE}")"\n'
+                 'fi\n'
+                 'mode="$(cat "${FAKE_HEALTH_MODE_FILE:-}" 2>/dev/null || echo "${FAKE_HEALTH_MODE:-bridge-workspace}")"\n'
+                 'hport="$(cat "${FAKE_HEALTH_PORT_FILE:-}" 2>/dev/null || echo "${FAKE_HEALTH_PORT:-$port}")"\n'
+                 'rfield="$(cat "${FAKE_HEALTH_READY_FILE:-}" 2>/dev/null || echo "${FAKE_HEALTH_READY:-true}")"\n'
+                 'status="ok"\n'
+                 '[[ "$rfield" == "true" ]] || status="unavailable"\n'
+                 'printf \'{"status":"%s","ready":%s,"app_server_alive":true,"provider_secret":true,"provider_config_ok":true,"instance":"%s","mode":"%s","port":%s}\\n\' "$status" "$rfield" "$instance" "$mode" "$hport"\n'
+                 'exit 0\n')
     for f in (stop, start, os.path.join(bindir, "curl"),
               os.path.join(bindir, "launchctl"), os.path.join(bindir, "ps")):
         os.chmod(f, 0o755)
@@ -863,6 +913,75 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
                 proc.wait(timeout=15)
 
+    def test_supervisor_health_ready_true_never_triggers_recovery(self):
+        # The fake curl 404s /ready (real-machine behavior), so a healthy
+        # stack here proves the supervisor reads /health only and never
+        # mistakes a missing /ready for a readiness failure.
+        with open(sentinel(self.state), "w") as fh:
+            fh.write("")
+        proc = self._spawn()
+        try:
+            self.assertTrue(wait_for(
+                lambda: pid_alive(read_pid(self.state, "bridge")) and
+                pid_alive(read_pid(self.state, "ngrok")), timeout=15),
+                "children up on healthy /health")
+            time.sleep(3)  # several polls with a fully healthy /health JSON
+            self.assertIsNone(proc.poll(), "supervisor stays up")
+            self.assertEqual(count_sup_lines(self.state, "recovery start:"), 0,
+                             "healthy /health must never trigger recovery")
+            self.assertEqual(count_sup_lines(self.state, "readiness failed"), 0)
+            self.assertEqual([c for c in calls(self.call_log) if c.endswith(" stop")],
+                             [], "no child stop while /health is healthy")
+        finally:
+            if proc.poll() is None:
+                os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
+                proc.wait(timeout=15)
+
+    def test_supervisor_health_ready_false_json_triggers_recovery(self):
+        # HTTP 200 with ready=false in the JSON body must NOT be treated as
+        # healthy (bare-200-is-not-healthy gate).
+        ready_file = os.path.join(self.d, "ready.json.flag")
+        with open(ready_file, "w") as fh:
+            fh.write("false")
+        with open(sentinel(self.state), "w") as fh:
+            fh.write("")
+        proc = self._spawn({"FAKE_HEALTH_READY_FILE": ready_file})
+        try:
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "recovery start: local readiness failure") >= 1,
+                timeout=20), "HTTP 200 with ready=false must trigger recovery")
+            self.assertTrue(pid_alive(read_pid(self.state, "bridge")),
+                            "children stay up after recovery")
+            lines = sup_log_lines(self.state)
+            self.assertTrue(any("/health is not ready" in ln for ln in lines),
+                            "recovery log must name the /health gate")
+        finally:
+            if proc.poll() is None:
+                os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
+                proc.wait(timeout=15)
+
+    def test_supervisor_health_wrong_identity_triggers_recovery(self):
+        # HTTP 200 with the wrong pinned identity must NOT be treated as
+        # healthy (identity gate: instance=local mode=bridge-workspace
+        # port=8321).
+        ident = os.path.join(self.d, "ident.flag")
+        with open(ident, "w") as fh:
+            fh.write("maintenance")
+        with open(sentinel(self.state), "w") as fh:
+            fh.write("")
+        proc = self._spawn({"FAKE_HEALTH_INSTANCE_FILE": ident})
+        try:
+            self.assertTrue(wait_for(
+                lambda: count_sup_lines(self.state, "recovery start: local readiness failure") >= 1,
+                timeout=20), "wrong identity on /health must trigger recovery")
+            lines = sup_log_lines(self.state)
+            self.assertTrue(any("/health is not ready" in ln for ln in lines),
+                            "recovery log must name the /health gate")
+        finally:
+            if proc.poll() is None:
+                os.kill(int(read_pid(self.state, "supervisor")), signal.SIGTERM)
+                proc.wait(timeout=15)
+
     def test_supervisor_public_health_threshold_and_backoff(self):
         ready_file = os.path.join(self.d, "pub.flag")
         with open(ready_file, "w") as fh:
@@ -1207,6 +1326,18 @@ class NewScriptInvariantsTest(unittest.TestCase):
             proc = subprocess.run(["bash", "-n", path], capture_output=True,
                                   text=True)
             self.assertEqual(proc.returncode, 0, path)
+
+    def test_supervisor_readiness_never_uses_ready_endpoint(self):
+        # Real-machine regression: the local supervisor misjudged a healthy
+        # stack as not-ready because it polled a non-existent /ready (404).
+        # The supervisor readiness path must only ever query /health (doc
+        # comments may mention /ready; executable code must not).
+        for path in (SUPERVISOR, CONTROL, LIB,
+                     os.path.join(ROOT, "scripts", "deactivate_maintenance_instance.sh")):
+            text = open(path, encoding="utf-8").read()
+            body = "\n".join(ln for ln in text.splitlines()
+                             if not ln.lstrip().startswith("#"))
+            self.assertNotIn("/ready", body, path)
 
 
 if __name__ == "__main__":

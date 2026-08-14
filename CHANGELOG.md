@@ -34,6 +34,22 @@
   identity/公网 health 任一步失败 → 自动重新启动 maintenance 并验证
   maintenance/bridge-workspace/8323 + 公网 health；只有 rollback 也失败才
   报明确 DOUBLE FAILURE。无 broad kill（managed start path only）。
+- **回归 4（实机暴露）：supervisor 误用不存在的 `/ready`**。local
+  supervisor 轮询 `http://127.0.0.1:8321/ready` 返回 404，把本已成功启动
+  且 local/public health 曾 OK 的 stack 判为 not ready，触发
+  recovery/backoff。修复：readiness 只走 `/health` 并严格解析 JSON
+  （`status=ok`、`ready=true`、`instance=local`、`mode=bridge-workspace`、
+  `port=8321`），HTTP 200 本身不作为健康；共享 `bridge_health_ready`
+  （supervisor_control 状态）同步改走 `/health`；fake curl 对 `/ready`
+  返回 404（实机行为），supervisor 代码/测试不再依赖 `/ready`。
+- **回归 5（实机暴露）：deactivate public handoff / rollback race**。
+  local health identity 已 OK 但 public health 未及时 OK，rollback 被过早
+  判 DOUBLE FAILURE（随后手工 start 立即成功，说明是时序而非真实故障）。
+  修复：local health ready 后对 fixed public endpoint 用 bounded
+  propagation polling（默认 45s/3s，env 可覆盖，绝不无限重试）；public
+  失败 rollback 前先重建 pause marker 并显式停 local managed children 再
+  启动 maintenance；rollback 自身 local health + public 各用 bounded budget
+  （默认 20s + 40s），真正超时才 DOUBLE FAILURE。
 - **single-writer host-ops lock**：新增 `scripts/host_ops_lock_lib.sh`——
   state root 下固定 `host-ops.lock` 目录，`mkdir` 原子获取；记录
   pid/operation/token/epoch（不含 secret）；同一父操作经导出 token 可重入；
@@ -47,6 +63,12 @@
   rollback 也失败→DOUBLE FAILURE）；health 回归 3 项（真实 server wiring +
   readiness）；installed-runtime config 依赖 1 项。全部 tmp/fake，不真
   launchctl、不 kill 真实进程。测试总量 248 = 244 通过 + 4 跳过。
+  本次集中修复后更新：`DeactivateRollbackTest` 10 项（新增 public 延迟数秒
+  后成功不 rollback、public 失败→pause+停 local→maintenance rollback 且
+  rollback public 延迟后成功、真正超时才 DOUBLE FAILURE）；runtime
+  supervisor 39→43（healthy `/health` 不触发 recovery、HTTP 200 但
+  `ready=false` 触发、错误 identity 触发、静态禁止 `/ready`）。
+  **测试总量 254 = 250 通过 + 4 跳过**。
 
 ### 运行时自动恢复：runtime + supervisor + per-instance LaunchAgent（2026-08-13）
 - 新增 `scripts/install_runtime.sh` / `scripts/uninstall_runtime.sh`：稳定

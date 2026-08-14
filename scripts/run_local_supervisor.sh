@@ -23,10 +23,12 @@
 #     bridge/ngrok PIDs (PID identity verified read-only; see
 #     scripts/pid_guard_lib.sh). Any child that truly exits is restarted
 #     through the idempotent start script with throttled/backed-off retries;
-#   - REAL readiness gate: /health or /ready must report ready=true
-#     (app-server alive + provider secret ref readable + provider config
-#     complete). A bare HTTP 200 is never treated as healthy. Readiness
-#     failures restart the managed stack (bounded by the restart lock);
+#   - REAL readiness gate: GET /health must report status=ok, ready=true
+#     and the pinned local identity (instance=local, mode=bridge-workspace,
+#     port=<local port>). The supervisor NEVER queries /ready (it does not
+#     exist on real instances; a bare HTTP 200 is never treated as healthy).
+#     Readiness failures restart the managed stack (bounded by the restart
+#     lock);
 #   - public tunnel health: the fixed public endpoint is checked with the
 #     same readiness gate. N consecutive failures (default 2) trigger a
 #     managed ngrok/bridge restart, guarded by a restart lock + backoff
@@ -149,30 +151,42 @@ stop_children() {
   BRIDGE_INSTANCE=local "$ROOT/scripts/stop_ngrok_bridge.sh" >>"$SUPERVISOR_LOG" 2>&1 || true
 }
 
-# Real local readiness: /ready must report ready=true (HTTP 200 only when
-# app-server alive + provider secret ref readable + provider config complete).
-local_ready() {
-  curl -fsS -m 10 "$BRIDGE_URL/ready" 2>>"$SUPERVISOR_LOG" | python3 -c 'import json,sys
+# Real readiness gate: GET $1/health must return JSON with status=ok,
+# ready=true and the pinned local identity (instance=local,
+# mode=bridge-workspace, port=<BRIDGE_PORT>). The supervisor NEVER queries
+# /ready (404 on the real instance); a bare HTTP 200 without the full JSON
+# gate is never treated as healthy. No body/domain content is printed.
+health_ready() {
+  local url="$1" body rc
+  body="$(curl -fsS -m 10 "$url/health" 2>>"$SUPERVISOR_LOG")" || return 1
+  rc=0
+  python3 -c 'import json,sys
 try:
     d = json.loads(sys.stdin.read())
-    sys.exit(0 if d.get("ready") is True else 1)
+    ok = d.get("status") == "ok" and d.get("ready") is True \
+         and d.get("instance") == "local" \
+         and d.get("mode") == "bridge-workspace" \
+         and d.get("port") == int(sys.argv[1])
+    sys.exit(0 if ok else 1)
 except Exception:
-    sys.exit(1)' 2>/dev/null
+    sys.exit(1)' "$BRIDGE_PORT" <<<"$body" || rc=1
+  return "$rc"
 }
 
-# Public tunnel readiness: same gate through the fixed public endpoint.
-# The recorded public_url state file is read inside; the value is never
-# printed by this supervisor.
+# Local readiness through the real /health gate on the local port.
+local_ready() {
+  health_ready "$BRIDGE_URL"
+}
+
+# Public tunnel readiness: same /health gate through the fixed public
+# endpoint (the tunnel serves the same local stack, so the identity fields
+# must match local). The recorded public_url state file is read inside; the
+# value is never printed by this supervisor.
 public_ready() {
   local url=""
   url="$(cat "$PUBLIC_URL_FILE" 2>/dev/null || true)"
   [[ -n "$url" ]] || return 1
-  curl -fsS -m 15 "$url/ready" 2>>"$SUPERVISOR_LOG" | python3 -c 'import json,sys
-try:
-    d = json.loads(sys.stdin.read())
-    sys.exit(0 if d.get("ready") is True else 1)
-except Exception:
-    sys.exit(1)' 2>/dev/null
+  health_ready "$url"
 }
 
 # Restart lock: only one recovery may run at a time (mkdir-based, owner pid
@@ -319,7 +333,7 @@ while [[ -f "$SENTINEL" ]]; do
 
   # Real readiness gate (app-server + provider secret ref + config).
   if ! local_ready; then
-    log "local readiness failed: $BRIDGE_URL/ready is not ready (app-server alive / provider secret ref / provider config); attempting full recovery"
+    log "local readiness failed: $BRIDGE_URL/health is not ready (status=ok / ready=true / instance=local / mode=bridge-workspace / port=$BRIDGE_PORT gate); attempting full recovery"
     recover_stack "local readiness failure" || true
     sleep "$POLL"
     continue

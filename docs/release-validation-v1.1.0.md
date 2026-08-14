@@ -36,15 +36,15 @@ done
 | test_sandbox_mode.py | 7 | 0 | 7 |
 | test_instance_isolation.py | 41 | 0 | 41 |
 | test_workspace_guard.py | 19 | 0 | 19 |
-| test_maintenance_instance.py | 50 | 0 | 50 |
+| test_maintenance_instance.py | 52 | 0 | 52 |
 | test_git_automation.py | 29 | 1 | 28 |
 | test_migrate_codex_home_permissions.py | 17 | 0 | 17 |
 | test_pid_guard.py | 10 | 3 | 7 |
-| test_runtime_supervisor.py | 39 | 0 | 39 |
+| test_runtime_supervisor.py | 43 | 0 | 43 |
 | test_activate_runtime_autorecovery.py | 11 | 0 | 11 |
 | test_bootstrap_autorecovery_command.py | 11 | 0 | 11 |
 | test_host_ops_lock.py | 11 | 0 | 11 |
-| **合计** | **248** | **4** | **244** |
+| **合计** | **254** | **4** | **250** |
 
 ### 跳过分类（4 项，均不计入通过）
 
@@ -54,7 +54,7 @@ done
 
 > 注：2026-08-13 基线的 11 项 runtime supervisor live 测试（pause-resume、
 > runtime-copy 运行）依赖 `ps`，在当时的 seatbelt 沙箱内跳过；本次复跑环境
-> 有 `ps`，39 项全部执行通过。
+> 有 `ps`，43 项全部执行通过。
 
 ## 2. 静态门禁（2026-08-14）
 
@@ -92,6 +92,26 @@ done
    stale cleanup；EXIT trap 释放。接入 activate/deactivate maintenance、
    activate_runtime_autorecovery、bootstrap_autorecovery.command。新增
    11 项 lock 测试。普通 task API 不获得任何 host-op 能力。
+5. **supervisor 误用不存在的 `/ready`（实机暴露）**：local supervisor
+   轮询 `http://127.0.0.1:8321/ready` 返回 404，把本已成功启动且
+   local/public health 曾 OK 的 stack 判为 not ready，触发 recovery/
+   backoff。修复：readiness 只走 `/health` 并严格解析 JSON（`status=ok`、
+   `ready=true`、`instance=local`、`mode=bridge-workspace`、
+   `port=8321`），HTTP 200 本身不作为健康；共享 `bridge_health_ready`
+   （supervisor_control 状态）同步改走 `/health`；fake curl 对 `/ready`
+   返回 404（实机行为），supervisor 代码/测试不再依赖 `/ready`。新增 4 项
+   supervisor 回归（healthy `/health` 不触发 recovery、HTTP 200 但
+   `ready=false` 触发、错误 identity 触发、静态禁止 `/ready`）。
+6. **deactivate public handoff / rollback race（实机暴露）**：local health
+   identity 已 OK 但 public health 未及时 OK，rollback 被过早判 DOUBLE
+   FAILURE。修复：local health ready 后对 fixed public endpoint 用 bounded
+   propagation polling（默认 45s/3s，env 可覆盖，绝不无限重试）；public
+   失败 rollback 前先重建 pause marker 并显式停 local managed children，
+   再启动 maintenance；rollback 自身 local health + public 各用 bounded
+   budget（默认 20s + 40s），真正超时才 DOUBLE FAILURE。新增/改写 3 项
+   deactivate 动态回归（public 延迟数秒后成功不 rollback；public 失败 →
+   pause + 停 local → maintenance rollback 且 rollback public 延迟后成功；
+   真正超时才 DOUBLE FAILURE），全部 tmp/fake。
 
 ## 3. Host activation 状态（明确 PENDING）
 

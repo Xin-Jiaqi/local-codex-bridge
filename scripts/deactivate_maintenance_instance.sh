@@ -18,13 +18,16 @@
 #       disabled -> local stays stopped (sentinel stays removed);
 #     a missing marker (pre-runtime window) is treated as enabled so legacy
 #     windows still restore local;
-#   - verifies local/public health when local was restored;
+#   - verifies local health + identity and then the public endpoint with a
+#     BOUNDED propagation grace (the fixed ngrok endpoint can take a few
+#     seconds to hand back after local health is OK; never retried forever);
 #   - fail-safe rollback: the maintenance stop is the point of no return, so
 #     from that moment ANY failure (local restore / local health / identity /
 #     public health) automatically re-opens the maintenance window and
 #     verifies maintenance/bridge-workspace/8323 + public health; only when
-#     that rollback ALSO fails is an explicit DOUBLE FAILURE reported (the
-#     original failure reason is always preserved);
+#     that rollback ALSO fails (after its own bounded propagation budget) is
+#     an explicit DOUBLE FAILURE reported (the original failure reason is
+#     always preserved);
 #   - NEVER deletes the maintenance state or $HOME/.codex-deepseek-maintenance
 #     (they are reused by the next maintenance window);
 #   - never touches hpc, Para/Japan or remote jobs.
@@ -41,6 +44,38 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log() { printf '[deactivate-maintenance] %s\n' "$*"; }
 
+# Bounded propagation budgets (env-overridable, hard-capped; never infinite).
+# Public handoff after local health is OK: the fixed ngrok endpoint can lag
+# a few seconds behind the app-server, so poll with a hard budget instead of
+# a single shot. Fail-safe rollback verification uses its own bounded
+# maintenance-local health wait + public propagation budget (~60s total).
+PUBLIC_PROPAGATION_SECS="${DEACTIVATE_PUBLIC_PROPAGATION_SECS:-45}"
+PUBLIC_PROPAGATION_POLL="${DEACTIVATE_PUBLIC_PROPAGATION_POLL:-3}"
+ROLLBACK_HEALTH_WAIT="${DEACTIVATE_ROLLBACK_HEALTH_WAIT:-20}"
+ROLLBACK_PUBLIC_PROPAGATION_SECS="${DEACTIVATE_ROLLBACK_PUBLIC_PROPAGATION_SECS:-40}"
+ROLLBACK_PUBLIC_PROPAGATION_POLL="${DEACTIVATE_ROLLBACK_PUBLIC_PROPAGATION_POLL:-3}"
+for _var in PUBLIC_PROPAGATION_SECS PUBLIC_PROPAGATION_POLL \
+            ROLLBACK_HEALTH_WAIT ROLLBACK_PUBLIC_PROPAGATION_SECS \
+            ROLLBACK_PUBLIC_PROPAGATION_POLL; do
+  _val="${!_var:-0}"
+  [[ "$_val" =~ ^[0-9]+$ && "$_val" -ge 1 ]] || eval "$_var"='45'
+done
+unset _var _val
+
+# Bounded polling for the fixed public endpoint (ngrok handoff propagation
+# grace): poll until OK or the budget is exhausted. Never retries forever.
+wait_public_ok() {
+  local url="$1" logf="$2" budget="$3" poll="$4" elapsed=0
+  while [[ "$elapsed" -lt "$budget" ]]; do
+    if bridge_health_ok "$url" "$logf"; then
+      return 0
+    fi
+    sleep "$poll"
+    elapsed=$((elapsed + poll))
+  done
+  return 1
+}
+
 ROLLBACK_ARMED=0
 ROLLBACK_DONE=0
 ROLLBACK_LOG=""
@@ -52,10 +87,12 @@ ROLLBACK_LOG=""
 # maintenance back up through the sanctioned start path (managed processes
 # only), re-raises the local pause hold + activation marker so the window
 # state stays consistent, and verifies maintenance identity
-# (maintenance/bridge-workspace/8323) + public health. Only when this
-# rollback itself fails is an explicit DOUBLE FAILURE reported. The original
-# failure reason always remains the exit reason; no secret/domain content is
-# printed.
+# (maintenance/bridge-workspace/8323) + public health, each with a BOUNDED
+# propagation budget (maintenance local health ready while the public
+# endpoint is still propagating is never prematurely declared DOUBLE
+# FAILURE). Only when this rollback itself times out is an explicit DOUBLE
+# FAILURE reported. The original failure reason always remains the exit
+# reason; no secret/domain content is printed.
 rollback() {
   [[ "${ROLLBACK_ARMED:-0}" == 1 && "${ROLLBACK_DONE:-0}" == 0 ]] || return 0
   ROLLBACK_DONE=1
@@ -75,17 +112,28 @@ rollback() {
     printf 'instance=%s\nsupervisor_state=%s\n' "$INSTANCE" "${PRE_SUPERVISOR:-enabled}" > "$MARKER" 2>/dev/null || true
     chmod 600 "$MARKER" 2>/dev/null || true
   fi
+  # 1b. Ensure the local managed children are stopped BEFORE maintenance is
+  #     brought back up (the pause marker holds them down for a live local
+  #     supervisor; the identity-guarded stop also covers the legacy start
+  #     flow when no supervisor is running).
+  BRIDGE_INSTANCE="$LOCAL" "$ROOT/scripts/stop_ngrok_bridge.sh" >>"$rlog" 2>&1 || true
   # 2. Bring maintenance back up (best-effort: it may already be up when the
   #    stop itself failed).
   BRIDGE_INSTANCE="$INSTANCE" "$ROOT/scripts/start_ngrok_bridge.sh" >>"$rlog" 2>&1 || true
-  # 3. Verify maintenance identity + public health.
+  # 3. Verify maintenance identity + public health with bounded polling: a
+  #    maintenance local health that is ready while the public endpoint is
+  #    still propagating must NOT be declared DOUBLE FAILURE prematurely.
   mport="$(bridge_instance_get "$INSTANCE" port 2>/dev/null || true)"
   [[ -n "$mport" ]] || mport="8323"
   murl="http://127.0.0.1:$mport"
-  if bridge_health_ok "$murl" "$rlog" \
-     && bridge_health_identity "$murl" "$INSTANCE" "bridge-workspace" "$mport" "$rlog"; then
-    ok=1
-  fi
+  for i in $(seq 1 "$ROLLBACK_HEALTH_WAIT"); do
+    if bridge_health_ok "$murl" "$rlog" \
+       && bridge_health_identity "$murl" "$INSTANCE" "bridge-workspace" "$mport" "$rlog"; then
+      ok=1
+      break
+    fi
+    sleep 1
+  done
   ref="$(bridge_instance_get "$INSTANCE" ngrok_domain_file 2>/dev/null || true)"
   if [[ -n "$ref" && -f "$ref" ]]; then
     domain="$(tr -d '[:space:]' < "$ref" 2>/dev/null || true)"
@@ -94,15 +142,15 @@ rollback() {
     domain="$(tr -d '[:space:]' < "$ROOT/.ngrok_domain" 2>/dev/null || true)"
   fi
   if [[ "$ok" == 1 && -n "$domain" ]]; then
-    bridge_health_ok "https://$domain" "$rlog" || ok=0
+    wait_public_ok "https://$domain" "$rlog" "$ROLLBACK_PUBLIC_PROPAGATION_SECS" "$ROLLBACK_PUBLIC_PROPAGATION_POLL" || ok=0
   fi
   if [[ "$ok" == 1 ]]; then
     printf '[deactivate-maintenance] rollback: maintenance window restored and verified (instance=%s mode=bridge-workspace port=%s, local+public health OK); the original failure remains the exit reason (rollback log: %s)\n' \
       "$INSTANCE" "$mport" "$rlog" >&2
     return 0
   fi
-  printf '[deactivate-maintenance] DOUBLE FAILURE: local restore/health failed AND the maintenance rollback could not be verified (instance=%s port=%s, local+public health); the public control plane may be DOWN - manual host intervention required (rollback log: %s)\n' \
-    "$INSTANCE" "$mport" "$rlog" >&2
+  printf '[deactivate-maintenance] DOUBLE FAILURE: local restore/health failed AND the maintenance rollback could not be verified within the bounded budgets (instance=%s port=%s, local+public health; %ss local + %ss public propagation); the public control plane may be DOWN - manual host intervention required (rollback log: %s)\n' \
+    "$INSTANCE" "$mport" "$ROLLBACK_HEALTH_WAIT" "$ROLLBACK_PUBLIC_PROPAGATION_SECS" "$rlog" >&2
   return 1
 }
 
@@ -249,8 +297,8 @@ elif [[ -n "$(bridge_instance_get "$LOCAL" ngrok_domain_file)" ]]; then
   DOMAIN="$(tr -d '[:space:]' < "$(bridge_instance_get "$LOCAL" ngrok_domain_file)" 2>/dev/null || true)"
 fi
 if [[ -n "$DOMAIN" ]]; then
-  if ! bridge_health_ok "https://$DOMAIN" "$DEACTIVATE_LOG"; then
-    die "public health did not become OK for the fixed endpoint (see $DEACTIVATE_LOG; the domain value is not printed)"
+  if ! wait_public_ok "https://$DOMAIN" "$DEACTIVATE_LOG" "$PUBLIC_PROPAGATION_SECS" "$PUBLIC_PROPAGATION_POLL"; then
+    die "public health did not become OK for the fixed endpoint within ${PUBLIC_PROPAGATION_SECS}s (see $DEACTIVATE_LOG; the domain value is not printed)"
   fi
   log "public health OK for the fixed endpoint (served by local again)"
 else

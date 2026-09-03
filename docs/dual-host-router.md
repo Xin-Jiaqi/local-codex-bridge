@@ -139,9 +139,28 @@ DeepSeek key → 起本地 bridge `127.0.0.1:8321` 并验证 `/health` + `/ready
 | （无） | dual-host 默认：本地 bridge + outbound worker；无 ngrok |
 | `-MacBridgeUrl <url>` | Mac 路由器公网 URL |
 | `-WorkerToken <token>` | 本次显式给 worker token（仍可 DPAPI 记忆） |
+| `-PairCode <code>` | 一次性 pairing：向 Mac Router HTTPS 领取 worker
+  token → DPAPI 保存 → 自动启动 worker（code 单次有效，见 §6.1） |
 | `-NoNgrok` | 只起本地 bridge（调试/准备；旧参数名保留兼容） |
 | `-NgrokCutover` | 回退旧"单机独占固定域名"模式（legacy） |
 | `-Stop` | 停本脚本启动的 bridge/worker/ngrok |
+
+### 6.1 免手搬 worker token：一次性 pairing（推荐）
+
+不复制/掩码输入长 token：Mac 用 `python3 scripts/prepare_worker_pairing.py`
+（仓库根；读 `.bridge_worker_token` 并以 worker token 认证，向
+`127.0.0.1:8321/internal/pairing/create` 注册一条 10 分钟、单次 code——只
+存 SHA-256 hash + expiry）。它打印 Windows 仓库根要执行的唯一一条命令：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 -PairCode <code>
+```
+
+ps1 向固定 Router URL 的 `/internal/pairing/claim`（HTTPS，code 本身即凭证，
+无需 token、管理员、ngrok 或公网端口）领取现有 worker token，用当前用户
+DPAPI 写入 `worker.token.dpapi` 后自动启动出站 worker；token 值只在 HTTPS
+响应中出现一次，服务端/日志/脚本均不打印。code 未知/过期/已用统一 404；
+换机器就重新 mint 一条。
 
 ## 7. 测试
 
@@ -150,8 +169,12 @@ DeepSeek key → 起本地 bridge `127.0.0.1:8321` 并验证 `/health` + `/ready
 - `tests/test_dual_host_http.py`（12）：真实 HTTP handler + 真实 worker 循环
   （线程内 fake Mac/Win app-server，无网络）：`/start` cwd 路由、映射路由、
   worker auth/offline/timeout、`/threads` 合并。
-- `tests/test_windows_support.py`（51：46 任意平台 + 5 Windows-only）：隔离
+- `tests/test_windows_support.py`（53：48 任意平台 + 5 Windows-only）：隔离
   迁移、DPAPI、worker 模式、wrapper、占位符、secret 面静态检查。
+- `tests/test_worker_pairing.py`（13）：pairing store 只落盘 hash+expiry、
+  过期/单次/并发原子性、HTTP create/claim 认证与 404/400/503、日志不含
+  code/token、Mac helper 子进程不打印 worker token；ps1 `-PairCode` 静态
+  结构检查并入 `test_windows_support.py`。
 - CI：上述三文件加入离线集合；py_compile 覆盖 `bridge/dual_host.py` 与
   `bridge/worker.py`。真实 Windows 主机尚未实机验证（见 README 已知限制）。
 

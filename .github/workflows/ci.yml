@@ -32,7 +32,8 @@ jobs:
             tests/test_host_ops_lock.py \
             tests/test_windows_support.py \
             tests/test_dual_host.py \
-            tests/test_dual_host_http.py; do
+            tests/test_dual_host_http.py \
+            tests/test_worker_pairing.py; do
             python3 "$t"
           done
       - name: py_compile

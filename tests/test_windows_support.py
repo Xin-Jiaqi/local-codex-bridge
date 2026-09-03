@@ -571,6 +571,52 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
             if "Get-Content" in line and "bridge_api_key" in line.lower():
                 self.fail("key file read via Get-Content at line %d" % lineno)
 
+    def test_pair_code_param_and_claim_flow(self):
+        # One-time pairing (-PairCode): claim over HTTPS from the Mac router,
+        # DPAPI-store the returned token, then start the worker automatically.
+        self.assertIn("[string]$PairCode", self.source)
+        self.assertIn(".PARAMETER PairCode", self.source)
+        self.assertIn("function Invoke-PairingClaim", self.source)
+        self.assertIn("internal/pairing/claim", self.source)
+        # claim runs inside the worker phase, before the token is resolved
+        # (the DPAPI copy just stored is what starts the worker), and the
+        # worker phase only runs after the local bridge is READY.
+        worker_phase = self.source.index("function Invoke-WorkerPhase")
+        invoke_claim = self.source.index("Invoke-PairingClaim", worker_phase)
+        ensure_token = self.source.index("$token = Ensure-WorkerToken",
+                                         worker_phase)
+        self.assertLess(invoke_claim, ensure_token)
+        main = self.source[self.source.index("function Invoke-Stop"):]
+        self.assertLess(main.index("Invoke-BridgePhase"),
+                        main.index("Invoke-WorkerPhase"))
+        # -PairCode is a dual-host (default-mode) flag only
+        guard = self.source.index(
+            "-not [string]::IsNullOrWhiteSpace($PairCode) -and "
+            "($NoNgrok -or $NgrokCutover)")
+        self.assertIn("requires the default dual-host mode", self.source[guard:])
+
+    def test_pairing_claim_never_echoes_token_or_code(self):
+        # The claim result must go straight into the DPAPI store: no
+        # Write-*/log line in the claim function may reference the token
+        # variable, and the stored value must use the same per-user DPAPI
+        # helper as the DeepSeek key (so Ensure-WorkerToken reloads it).
+        claim = self.source.split("function Invoke-PairingClaim", 1)[1]
+        claim = claim.split("function Ensure-WorkerToken", 1)[0]
+        self.assertIn("Protect-BridgeSecretText $script:WorkerTokenFile",
+                      claim)
+        # reading $resp.token (null-guarded) is fine; echoing it is not
+        echo_only = re.sub(r"\$resp\.token", "", claim)
+        echoing = re.compile(
+            r"^\s*(Write-Host|Write-Info|Write-Fail|Write-Output|"
+            r"Write-Error).*", re.I
+        )
+        for lineno, line in enumerate(echo_only.splitlines(), 1):
+            if echoing.match(line) and re.search(
+                    r"\$(resp\.token|claimed|tokenvalue|workertokenvalue)",
+                    line):
+                self.fail("pairing token echoed at claim line %d: %s"
+                          % (lineno, line.strip()))
+
     def test_env_keys_defined_before_snapshot_helpers(self):
         # Save-EnvSnapshot/Restore-Env iterate $script:EnvKeys; under
         # Set-StrictMode an undefined script variable aborts the whole run,

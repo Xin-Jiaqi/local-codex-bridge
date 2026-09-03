@@ -19,6 +19,10 @@ this module provides:
   http://127.0.0.1:8321 and reports results back. The queue is bounded, every
   job expires, responses are size-capped and logs never contain prompts or
   secrets.
+- PairingCodeStore: one-time, short-lived worker-token pairing codes. The
+  Mac registers only the SHA-256 hash + expiry of each code; the Windows
+  machine claims one over HTTPS and receives the existing worker token.
+  Codes are never stored in plaintext and never logged.
 - DualHostRouter: the facade used by the HTTP handlers: target resolution
   (mapping first, then a safe non-mutating probe of both ends when the
   mapping is missing) and remote dispatch with bounded waits.
@@ -29,6 +33,7 @@ be unit-tested offline (CI runs on Linux).
 
 import json
 import calendar
+import hashlib
 import os
 import tempfile
 import threading
@@ -55,6 +60,13 @@ MAX_JOB_BODY_BYTES = 64 * 1024       # mirrors the public API body cap
 DEFAULT_POLL_TIMEOUT_S = 15.0
 MAX_POLL_TIMEOUT_S = 30.0
 WORKER_STALE_S = 45.0        # no poll/result for this long => worker offline
+
+# One-time worker-token pairing bounds (endpoint-level, see server.py).
+MAX_PAIRING_CODES = 16
+DEFAULT_PAIRING_TTL_S = 600
+MAX_PAIRING_TTL_S = 900
+MIN_PAIRING_CODE_LEN = 16
+MAX_PAIRING_CODE_LEN = 200
 
 # Bounded router-side waits for remote operations (seconds). Observe is
 # special-cased: wait_ms/1000 + headroom, because the local bridge itself
@@ -200,6 +212,140 @@ class ThreadTargetMap:
     def __len__(self):
         with self._lock:
             return len(self._entries)
+
+
+class PairingCodeStore:
+    """One-time, short-lived worker-token pairing codes (single-use claim).
+
+    Only the SHA-256 digest of each code is ever persisted, next to its
+    expiry timestamp (one small json file per code; never the code itself and
+    never the worker token). ``consume`` is atomic - the file is renamed, so
+    exactly one concurrent claimant can ever win - which makes a code
+    strictly single-use even when two Windows machines race for it. Expired
+    or unknown codes are indistinguishable and simply fail the claim.
+
+    The store lives in the instance state dir (next to the thread map), so a
+    Mac bridge restart does not invalidate an already-minted code.
+    """
+
+    def __init__(self, directory, clock=None):
+        self.directory = directory
+        self._clock = clock or time.time
+
+    def _path_for(self, code):
+        digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        return os.path.join(self.directory, digest + ".json")
+
+    def register(self, code, ttl_s=DEFAULT_PAIRING_TTL_S):
+        """Atomically write (or refresh) one pairing code. False on invalid input."""
+        if not isinstance(code, str) or not code.strip():
+            return False
+        code = code.strip()
+        if not (MIN_PAIRING_CODE_LEN <= len(code) <= MAX_PAIRING_CODE_LEN):
+            return False
+        ttl_s = max(1, min(int(ttl_s), MAX_PAIRING_TTL_S))
+        self._prune_expired()
+        os.makedirs(self.directory, exist_ok=True)
+        payload = json.dumps({"expires_at": self._clock() + ttl_s})
+        fd, tmp_path = tempfile.mkstemp(prefix="pairing-", dir=self.directory)
+        try:
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp_path, self._path_for(code))
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        self._enforce_cap()
+        return True
+
+    def consume(self, code):
+        """Atomically claim one code. True exactly once per registered code."""
+        if not isinstance(code, str) or not code.strip():
+            return False
+        code = code.strip()
+        if not (MIN_PAIRING_CODE_LEN <= len(code) <= MAX_PAIRING_CODE_LEN):
+            return False
+        path = self._path_for(code)
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return False
+        expires_at = data.get("expires_at") if isinstance(data, dict) else None
+        if not isinstance(expires_at, (int, float)) or self._clock() > expires_at:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return False
+        claimed_path = path + ".claimed"
+        try:
+            os.rename(path, claimed_path)  # atomic: only one claimant wins
+        except OSError:
+            return False
+        try:
+            os.unlink(claimed_path)  # consumed; the winner cleans up
+        except OSError:
+            pass
+        return True
+
+    def _prune_expired(self):
+        """Best-effort removal of expired codes and stale .claimed leftovers."""
+        if not os.path.isdir(self.directory):
+            return
+        now = self._clock()
+        for name in os.listdir(self.directory):
+            path = os.path.join(self.directory, name)
+            if not name.endswith((".json", ".claimed")):
+                continue
+            if not os.path.isfile(path):
+                continue
+            try:
+                if name.endswith(".claimed"):
+                    # the winner deletes it right after a successful claim,
+                    # so any leftover is stale by construction
+                    os.unlink(path)
+                    continue
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if (not isinstance(data, dict)
+                        or not isinstance(data.get("expires_at"), (int, float))
+                        or now > data["expires_at"]):
+                    os.unlink(path)
+            except (OSError, ValueError):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def _enforce_cap(self):
+        """Keep at most MAX_PAIRING_CODES live codes (drop oldest first)."""
+        if not os.path.isdir(self.directory):
+            return
+        self._prune_expired()
+        live = sorted(
+            (os.path.join(self.directory, name) for name in os.listdir(self.directory)
+             if name.endswith(".json")),
+            key=os.path.getmtime,
+        )
+        for path in live[:max(0, len(live) - MAX_PAIRING_CODES)]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 class BrokerBusyError(Exception):

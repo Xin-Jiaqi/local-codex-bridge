@@ -147,13 +147,40 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridg
 （默认 `https://diploma-ideology-skier.ngrok-free.dev`，可用
 `-MacBridgeUrl` 或 `MAC_BRIDGE_URL` 覆盖），把 `start/continue/observe/
 steer/interrupt/read/list` 任务转发到本机 8321 并回传结果。**不装 ngrok、
-不占用任何公网域名**；worker token 首次以掩码输入（或 `-WorkerToken` 传参），
-DPAPI 加密保存。Mac 路由器还没开 dual-host 时，worker 会带退避后台重试，
+不占用任何公网域名**；worker token 首次以掩码输入（或 `-WorkerToken` 传参、
+或 `-PairCode` 一次性领取，见下），DPAPI 加密保存。Mac 路由器还没开
+dual-host 时，worker 会带退避后台重试，
 本地 bridge 照常可用——Windows 离线或路由器抖动都不会反过来拖慢 Mac。
 停止：同一命令加 `-Stop`（只停本脚本启动的进程）。
 
 本地纯调试 / 只起 bridge 不起 worker：加 `-NoNgrok`（该参数与旧版含义一致，
 只是如今默认模式已经与 ngrok 无关，改名 `-LocalOnly` 更贴切，为兼容保留）。
+
+### 免手搬 token：一次性 pairing（推荐，10 分钟单次）
+
+不想把长 worker token 手工复制/掩码输入？Mac 端 mint 一条**短时、单次**
+pairing code——路由器只保存 code 的 SHA-256 哈希 + 过期时间，code 领取一次
+即失效，服务端与日志绝不打印 code/token：
+
+1. Mac（仓库根；bridge 需已按上文开启 dual-host）：
+
+   ```bash
+   python3 scripts/prepare_worker_pairing.py
+   ```
+
+   它只打印一条 Windows 命令（形如下面）与 code（10 分钟有效）：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 -PairCode <code>
+   ```
+
+2. Windows 在仓库根 PowerShell 执行该命令：`start_local_codex_bridge.ps1`
+   通过 HTTPS 向当前固定 Router URL 的 `/internal/pairing/claim` 领取现有
+   worker token（Windows 不开公网端口、不需要管理员、不需要 ngrok），用
+   当前用户 DPAPI 存入 `worker.token.dpapi`（与掩码输入同一存储，值绝不
+   打印），随后自动启动出站 worker。code 单次有效、过期作废；换机器/换
+   token 时在 Mac 重新 mint 一条即可。code 是转录里唯一的 secret——不要
+   粘贴进聊天工具，用完即弃。
 
 ### Desktop OpenAI / Bridge DeepSeek 隔离（Windows，用人话）
 
@@ -198,6 +225,11 @@ Windows 面向 `local` 实例）。
   队列/响应/超时全部有界，日志只含 job id/kind/状态码——prompt、key、token
   一律不入日志；worker 本地的转发目标由 kind 静态决定，路由器给什么 URL
   都改不了它。
+- **一次性 worker pairing**（`/internal/pairing/create|claim`）：create 需
+  worker token（Mac helper 只走 `127.0.0.1`），claim 以短时 code 本身为
+  凭证、必须走固定 Router 的 HTTPS；Mac 只落盘 code 的 SHA-256 + expiry，
+  单次原子领取（并发也只会成功一次），未知/过期/已用 code 统一 404，code
+  与 token 一律不入日志。
 - Mac 侧未配置 token 时内部 API 返回 404/503，公开 API 行为零变化；
   `/health` 仅在 dual-host 开启时附加 `dual_host` 状态字段。
 - 除 secret 外前置条件全部自动：Python 3.8+ 缺失时 winget
@@ -608,8 +640,13 @@ tests/
                              Mac/Win app-server，无网络）：/start 按 cwd 路由、映射
                              路由、worker auth/offline/timeout、/threads 合并
   test_windows_support.py     离线单测：Windows 默认路径/codex 探测/npm shim/argv 兼容
-                             （51 项：46 项任意平台 + 5 项 Windows-only）+ PowerShell
-                             bootstrap 结构/DPAPI/worker 模式/secret 面静态检查
+                             （53 项：48 项任意平台 + 5 项 Windows-only）+ PowerShell
+                             bootstrap 结构/DPAPI/worker 模式/-PairCode pairing
+                             claim 与 secret 面静态检查
+  test_worker_pairing.py      离线单测：一次性 worker pairing（store 只落盘
+                             SHA-256+expiry、单次原子领取/过期/并发、HTTP
+                             create/claim 认证与 404/503、日志无 code/token、
+                             Mac helper 不打印 worker token）
 .github/workflows/ci.yml   GitHub Actions：离线安全测试 + py_compile + bash -n + plist lint（无 secret/网络）
 openapi.yaml            公共 Actions 模板（servers URL 为占位符）
 schemas/                codex app-server 协议 JSON Schema（v1/v2，参考用）

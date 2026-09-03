@@ -78,6 +78,14 @@
     script reuses the DPAPI-protected copy and asks once (masked) on first
     use.
 
+.PARAMETER PairCode
+    One-time pairing code minted on the Mac by
+    scripts\prepare_worker_pairing.py. The script claims the existing worker
+    token over HTTPS from the Mac router (single-use server-side), stores it
+    with Windows DPAPI (CurrentUser) and then starts the outbound worker
+    automatically. The token value is never printed. Default mode only:
+    incompatible with -NoNgrok / -NgrokCutover.
+
 .PARAMETER NgrokCutover
     Legacy one-machine-at-a-time mode (deprecated): start ngrok so Windows
     owns the fixed domain. Requires the macOS bridge to be stopped first.
@@ -108,6 +116,10 @@
         -MacBridgeUrl https://diploma-ideology-skier.ngrok-free.dev -WorkerToken <token>
 
 .EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 `
+        -PairCode <one-time-code-from-the-Mac>
+
+.EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 -Stop
 
 .EXAMPLE
@@ -120,6 +132,7 @@ param(
     [switch]$NgrokCutover,
     [string]$MacBridgeUrl = "",
     [string]$WorkerToken = "",
+    [string]$PairCode = "",
     [string]$Domain = "",
     [string]$CodexHome = "",
     [string]$WorkRoot = "",
@@ -1084,6 +1097,56 @@ function Resolve-MacBridgeUrl {
     return $script:MacBridgeUrlDefault
 }
 
+function Invoke-PairingClaim {
+    # One-time worker pairing: claim the existing Mac router worker token
+    # with a single-use, short-lived code (minted on the Mac by
+    # scripts/prepare_worker_pairing.py) over HTTPS from the fixed router
+    # URL. The returned token is DPAPI-stored for this user and is NEVER
+    # printed; the router stores only the code's SHA-256 hash + expiry and
+    # invalidates it after the first successful claim.
+    $routerUrl = (Resolve-MacBridgeUrl).TrimEnd('/')
+    $claimBody = @{ code = $PairCode } | ConvertTo-Json
+    $claimUrl = "$routerUrl/internal/pairing/claim"
+    $resp = $null
+    try {
+        $resp = Invoke-RestMethod -Uri $claimUrl -Method Post `
+            -ContentType "application/json" -Body $claimBody -TimeoutSec 30
+    } catch {
+        $serverHint = ""
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $raw = $reader.ReadToEnd()
+                $parsed = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($parsed.error.message) { $serverHint = ": $($parsed.error.message)" }
+            }
+        } catch { }
+        $claimBody = $null
+        $script:PairCode = ""
+        Write-Fail "pairing claim failed against $routerUrl$serverHint ($($_.Exception.Message))"
+        Write-Host "The Mac pairing code is single-use and short-lived; mint a fresh code on"
+        Write-Host "the Mac with:  python3 scripts/prepare_worker_pairing.py"
+        Write-Host "(make sure the Mac bridge runs with BRIDGE_DUAL_HOST=true and"
+        Write-Host " BRIDGE_WORKER_TOKEN set, and that $routerUrl is reachable from here)"
+        Exit-With 6
+    }
+    $claimed = ""
+    if ($resp -and $resp.token) { $claimed = [string]$resp.token }
+    $resp = $null
+    $claimBody = $null
+    $script:PairCode = ""
+    if ([string]::IsNullOrWhiteSpace($claimed)) {
+        Write-Fail "the Mac router answered the pairing claim without a worker token; dual-host is probably not enabled on the Mac bridge"
+        Exit-With 6
+    }
+    Initialize-SecretsDir
+    Protect-BridgeSecretText $script:WorkerTokenFile $claimed
+    $script:WorkerTokenValue = $claimed
+    $claimed = $null
+    Write-Info "worker pairing claimed from $routerUrl; token stored with Windows DPAPI (value never printed)"
+}
+
 function Ensure-WorkerToken {
     # Worker token = the Mac router's BRIDGE_WORKER_TOKEN (independent of the
     # bridge API keys). Resolution: -WorkerToken > session env > DPAPI store >
@@ -1210,6 +1273,9 @@ function Wait-WorkerConnected {
 
 function Invoke-WorkerPhase {
     $script:MacBridgeUrl = Resolve-MacBridgeUrl
+    if (-not [string]::IsNullOrWhiteSpace($PairCode)) {
+        Invoke-PairingClaim
+    }
     $token = Ensure-WorkerToken
     if ([string]::IsNullOrWhiteSpace($token)) {
         Write-Info "worker token unavailable (non-interactive run): dual-host worker NOT started; the local bridge stays up"
@@ -1446,6 +1512,10 @@ try {
     if ($Stop) {
         Invoke-Stop
         exit 0
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PairCode) -and ($NoNgrok -or $NgrokCutover)) {
+        Write-Fail "-PairCode claims a worker token from the Mac router and starts the outbound worker; it requires the default dual-host mode (drop -NoNgrok / -NgrokCutover)"
+        exit 2
     }
     if (-not [string]::IsNullOrWhiteSpace($CodexHome)) {
         $script:CodexHome = $CodexHome.Trim()

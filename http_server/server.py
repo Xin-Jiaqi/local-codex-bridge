@@ -57,8 +57,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bridge import AppServerError, BridgeCore, CodexAppServerClient, Logger
 from bridge.core import MODEL, MODEL_PROVIDER, REASONING_EFFORT
 from bridge.dual_host import (
+    DEFAULT_PAIRING_TTL_S,
     DEFAULT_POLL_TIMEOUT_S,
+    MAX_PAIRING_CODE_LEN,
+    MAX_PAIRING_TTL_S,
+    MIN_PAIRING_CODE_LEN,
     OBSERVE_HEADROOM_S,
+    PairingCodeStore,
     REMOTE_OP_WAIT_S,
     TARGET_MAC,
     TARGET_WINDOWS,
@@ -662,6 +667,18 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 self._require_worker_auth()
                 self._handle_worker_result(self._read_body())
                 return
+            if path == "/internal/pairing/create":
+                # Mint a one-time pairing code (Mac side, localhost): requires
+                # the worker token, stores only hash + expiry server-side.
+                self._require_worker_auth()
+                self._handle_pairing_create(self._read_body())
+                return
+            if path == "/internal/pairing/claim":
+                # Single-use claim (Windows side, HTTPS to the fixed router
+                # URL): the pairing code itself is the bearer credential, so
+                # NO worker token is required here by design.
+                self._handle_pairing_claim(self._read_body())
+                return
             self._require_auth()
             if path == "/start":
                 self._handle_start(self._read_body())
@@ -739,6 +756,80 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         self._send_json(200 if r["ready"] else 503, payload)
 
     # ------------------------------------------- internal worker API
+
+    def _pairing_store(self):
+        """PairingCodeStore next to the persisted thread map (same state dir)."""
+        router = getattr(self.server, "router", None)
+        if router is None or not router.enabled:
+            raise HttpApiError(404, "not found: %s" % self.path, "not_found")
+        map_path = getattr(router.thread_map, "path", None)
+        if not map_path:
+            raise HttpApiError(404, "not found: %s" % self.path, "not_found")
+        return PairingCodeStore(os.path.join(os.path.dirname(map_path), "pairing"))
+
+    @staticmethod
+    def _pairing_code(body):
+        code = body.get("code")
+        if not isinstance(code, str) or not code.strip():
+            raise HttpApiError(400, "missing or invalid field: code", "bad_request")
+        code = code.strip()
+        if not (MIN_PAIRING_CODE_LEN <= len(code) <= MAX_PAIRING_CODE_LEN):
+            raise HttpApiError(
+                400,
+                "pairing code must be %d-%d characters"
+                % (MIN_PAIRING_CODE_LEN, MAX_PAIRING_CODE_LEN),
+                "bad_request",
+            )
+        return code
+
+    def _handle_pairing_create(self, body):
+        """Register a one-time code: only its SHA-256 hash + expiry are stored.
+
+        Reachable only with the worker token (the Mac helper calls it against
+        127.0.0.1). The response never echoes the code or the token.
+        """
+        store = self._pairing_store()
+        code = self._pairing_code(body)
+        ttl_s = self._require_int(body, "ttl_s", DEFAULT_PAIRING_TTL_S,
+                                  MAX_PAIRING_TTL_S)
+        if ttl_s < 1:
+            ttl_s = DEFAULT_PAIRING_TTL_S
+        store.register(code, ttl_s)
+        self.server.log.info(
+            "worker pairing: one-time code registered (ttl=%ds; only a "
+            "SHA-256 hash is stored, value never logged)" % ttl_s
+        )
+        self._send_json(200, {"ok": True, "ttl_s": ttl_s})
+
+    def _handle_pairing_claim(self, body):
+        """Single-use claim returning the existing worker token.
+
+        The pairing code is the bearer credential (no worker token required).
+        A code can win exactly once (atomic consume); unknown, expired and
+        used codes all look identical. The token is returned to the claimant
+        only and is never written to any log.
+        """
+        token = self.server.worker_token or ""
+        if not token:
+            raise HttpApiError(
+                503,
+                "worker API is not enabled: set %s on the Mac bridge and "
+                "restart it" % WORKER_TOKEN_ENV,
+                "worker_api_disabled",
+            )
+        store = self._pairing_store()
+        code = self._pairing_code(body)
+        if not store.consume(code):
+            raise HttpApiError(
+                404,
+                "pairing code not found, expired or already used",
+                "pairing_not_found",
+            )
+        self.server.log.info(
+            "worker pairing: one-time code consumed; worker token issued "
+            "(token value never logged)"
+        )
+        self._send_json(200, {"token": token})
 
     def _handle_worker_poll(self, body):
         router = self.server.router

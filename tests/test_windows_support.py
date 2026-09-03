@@ -23,6 +23,12 @@ that secrets (API key / ngrok authtoken) are never echoed or written, and
 that no path is ever built at load time from still-empty layout placeholders
 (Windows PowerShell aborts such runs with a 'parameter "Path" is an empty
 string' binding error) - all env-driven path variables are guarded instead.
+External commands resolve to plain string paths (Get-CommandPath:
+Source/Definition fallback, no object .Path); the bridge/ngrok
+Start-Process -PassThru launches guard the PS 5.1 dead-child "Property Path
+not found" shape and never write a pid for an exited child; catch blocks
+print the failing script line + PowerShell stack without echoing argument
+values (no secret surface).
 """
 
 import json
@@ -485,7 +491,7 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
     def test_codex_install_fallbacks_stay_automatic(self):
         # npm global install first, then the official native installer, then
         # PATH refresh and re-detection; instructions only as a last resort.
-        self.assertIn('npm.Source install -g "@openai/codex"', self.source)
+        self.assertIn('& $npm install -g "@openai/codex"', self.source)
         self.assertGreaterEqual(self.source.count("chatgpt.com/codex/install.ps1"), 2)
         auto_run = self.source.index('irm https://chatgpt.com/codex/install.ps1 | iex')
         segment = self.source[auto_run:auto_run + 400]
@@ -627,6 +633,100 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
                         main_region.index(default))
         self.assertIn("IsNullOrWhiteSpace($env:BRIDGE_WORK_ROOT)", main_region)
         self.assertIn("$script:WorkRoot = $WorkRoot.Trim()", main_region)
+
+    # -------- PS 5.1 object-shape regression (command/.Path + dead child) --
+    def test_external_commands_resolve_to_plain_string_paths(self):
+        # Get-Command returns different CommandInfo shapes on Windows
+        # PowerShell 5.1 vs PowerShell 7. Every external command (python, py,
+        # winget, codex, npm, ngrok) is resolved through Get-CommandPath,
+        # which returns a plain string from the always-string Source /
+        # Definition members with a guarded fallback; object-only members
+        # such as .Path are never read from a command/process result.
+        helper = self.source[self.source.index("function Get-CommandPath"):
+                             self.source.index("function Refresh-PathFromRegistry")]
+        self.assertIn("[string]$command.Source", helper)
+        self.assertIn("[string]$command.Definition", helper)
+        self.assertNotIn("$command.Path", helper)
+        for name in ('"python.exe"', '"py.exe"', '"winget.exe"',
+                     '"codex.exe"', '"codex.cmd"', '"npm.cmd"', '"ngrok.exe"'):
+            self.assertIn("Get-CommandPath %s" % name, self.source,
+                          "%s must be resolved via Get-CommandPath" % name)
+        # the raw Get-Command ... .Source pattern is gone from call sites
+        for name in ("python.exe", "py.exe", "winget.exe",
+                     "codex.exe", "codex.cmd", "npm.cmd", "ngrok.exe"):
+            self.assertNotIn("Get-Command %s" % name, self.source)
+
+    def test_bridge_launch_guards_ps51_dead_child_path_error(self):
+        # Windows PowerShell 5.1 Start-Process -PassThru throws "Property
+        # 'Path' cannot be found on this object" when the child exits before
+        # the wrapper is returned (PS 7.2.8+ instead returns an exited
+        # Process). The bridge launch must catch that shape, never write a
+        # pid file for a dead child, and surface logs + the failure site.
+        ensure = self.source[self.source.index("function Ensure-Bridge"):
+                             self.source.index("function Wait-LocalHealth")]
+        start = ensure.index("Start-Process -FilePath")
+        pid_write = ensure.index(
+            '[System.IO.File]::WriteAllText($script:BridgePidFile, "$($proc.Id)")'
+        )
+        self.assertLess(ensure.index("try {"), start)
+        self.assertLess(start, ensure.index("} catch {"))
+        has_exited = ensure.index("$proc.HasExited")
+        self.assertLess(has_exited, pid_write)
+        catch_region = ensure[ensure.index("} catch {"):]
+        self.assertIn("Write-FailDetail $startError", catch_region)
+        self.assertIn("Show-BridgeLogTail", catch_region)
+        self.assertIn("Exit-With 5", catch_region)
+        # between the HasExited probe and the pid write: logs, then bail out
+        immediate = ensure[has_exited:pid_write]
+        self.assertIn("Show-BridgeLogTail", immediate)
+        self.assertIn("Exit-With 5", immediate)
+        # never read .Path off the Start-Process/Process result; the
+        # launcher receives a plain [string] path
+        self.assertNotIn("$proc.Path", ensure)
+        self.assertIn("$pythonPath = [string]$python.Path", ensure)
+
+    def test_ngrok_launch_guards_ps51_dead_child_path_error(self):
+        # Same PS 5.1 dead-child guard for the ngrok launch.
+        ngrok_phase = self.source[self.source.index("function Invoke-NgrokPhase"):
+                                  self.source.index("function Invoke-Stop")]
+        launch = ngrok_phase[ngrok_phase.index("starting ngrok:"):]
+        self.assertIn("try {", launch)
+        self.assertIn("} catch {", launch)
+        self.assertLess(launch.index("try {"), launch.index("Start-Process -FilePath"))
+        self.assertLess(launch.index("Start-Process -FilePath"),
+                        launch.index("} catch {"))
+        pid_write = ngrok_phase.index(
+            '[System.IO.File]::WriteAllText($script:NgrokPidFile, "$($ngrokProc.Id)")'
+        )
+        has_exited = ngrok_phase.index("$ngrokProc.HasExited")
+        self.assertLess(has_exited, pid_write)
+        self.assertIn("Write-FailDetail $startError", ngrok_phase)
+        self.assertNotIn("$ngrokProc.Path", ngrok_phase)
+        immediate = ngrok_phase[has_exited:pid_write]
+        self.assertIn("Show-NgrokLogTail", immediate)
+        self.assertIn("Exit-With 6", immediate)
+
+    def test_catch_diagnostics_report_line_and_stack_without_secrets(self):
+        # Failure output must include the script line + PowerShell stack so
+        # Windows PowerShell 5.1 errors are diagnosable, but only positions /
+        # stack text are echoed: InvocationInfo.Line (raw argument text) is
+        # deliberately never printed and no secret env value is interpolated.
+        detail = self.source[self.source.index("function Write-FailDetail"):
+                             self.source.index("function Require-EnvPath")]
+        self.assertIn("ScriptLineNumber", detail)
+        self.assertIn("ScriptName", detail)
+        self.assertIn("ScriptStackTrace", detail)
+        # no actual Line-text access may ever be echoed (only positions)
+        self.assertNotIn("$Record.InvocationInfo.Line", detail)
+        self.assertNotIn("$invocation.Line", detail)
+        self.assertNotIn("$env:BRIDGE_API_KEY", detail)
+        self.assertNotIn("$env:DEEPSEEK_API_KEY", detail)
+        self.assertNotIn("$env:NGROK_AUTHTOKEN", detail)
+        # every top-level failure path routes through the detail printer
+        self.assertIn("Write-FailDetail $_", self.source)
+        main_catch = self.source[self.source.rindex("} catch {"):]
+        self.assertIn("Write-FailDetail $_", main_catch)
+        self.assertIn("exit 1", main_catch)
 
 
 if __name__ == "__main__":

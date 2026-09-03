@@ -87,7 +87,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------------ layout
-$script:Version = "windows-bootstrap-1.0.2"
+$script:Version = "windows-bootstrap-1.0.3"
 $script:FixedDomainDefault = "diploma-ideology-skier.ngrok-free.dev"
 $script:Instance = "local"
 $script:HostAddr = "127.0.0.1"
@@ -163,6 +163,33 @@ function Exit-With([int]$Code, [string]$Message) {
     exit $Code
 }
 
+function Write-FailDetail {
+    # Diagnostic printer for catch blocks: exception message plus the script
+    # position / PowerShell stack of the failure. Only positions and stack
+    # text are echoed - never InvocationInfo.Line or argument values - so no
+    # secret can leak through this output.
+    param([System.Management.Automation.ErrorRecord]$Record)
+    if (-not $Record) { return }
+    if ($Record.Exception -and $Record.Exception.Message) {
+        Write-Fail $Record.Exception.Message
+    } else {
+        Write-Fail $Record.ToString()
+    }
+    $invocation = $Record.InvocationInfo
+    if ($invocation -and $invocation.ScriptLineNumber -gt 0) {
+        $commandName = ""
+        if ($invocation.MyCommand) { $commandName = [string]$invocation.MyCommand.Name }
+        Write-Host "[start]   raised by '$commandName' at $($invocation.ScriptName) line $($invocation.ScriptLineNumber)" -ForegroundColor Yellow
+    }
+    $stackTrace = $Record.ScriptStackTrace
+    if (-not [string]::IsNullOrWhiteSpace($stackTrace)) {
+        Write-Host "[start]   PowerShell stack:" -ForegroundColor Yellow
+        foreach ($stackLine in ($stackTrace -split "`r?`n")) {
+            Write-Host "[start]     $stackLine" -ForegroundColor Yellow
+        }
+    }
+}
+
 function Require-EnvPath([string]$Name) {
     # Returns the trimmed value of a required Windows path env var, or throws
     # a diagnosable error. Every Join-Path/New-Item input that originates from
@@ -174,6 +201,24 @@ function Require-EnvPath([string]$Name) {
         throw "the required Windows path environment variable '$Name' is empty or unset; run this script from a normal Windows desktop session (set '$Name' and open a new terminal)"
     }
     return $value.Trim()
+}
+
+function Get-CommandPath([string]$Name) {
+    # Resolve $Name (an exe/cmd on PATH) to an executable file path as a
+    # PLAIN STRING, or $null. Windows PowerShell 5.1 and PowerShell 7 return
+    # different CommandInfo shapes, so only the always-string members Source /
+    # Definition are read (each guarded); callers never touch object-only
+    # members such as .Path that do not exist on every CommandInfo. Every
+    # external command launch in this script goes through this function.
+    $command = Get-Command -Name $Name -ErrorAction SilentlyContinue
+    if (-not $command) { return $null }
+    $commandPath = $null
+    try { $commandPath = [string]$command.Source } catch { $commandPath = $null }
+    if ([string]::IsNullOrWhiteSpace($commandPath)) {
+        try { $commandPath = [string]$command.Definition } catch { $commandPath = $null }
+    }
+    if ([string]::IsNullOrWhiteSpace($commandPath)) { return $null }
+    return $commandPath.Trim()
 }
 
 # ------------------------------------------------------------------ python
@@ -203,14 +248,16 @@ function Test-PythonProbe([string]$Exe, [string[]]$Extra) {
 
 function Get-PythonCommand {
     # Returns @{ Path; Extra = @() | @("-3") } for Python >= 3.8, or $null.
-    $pythonCmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($pythonCmd -and $pythonCmd.Source -notlike "*WindowsApps*" -and
-        (Test-PythonProbe $pythonCmd.Source @())) {
-        return @{ Path = $pythonCmd.Source; Extra = @() }
+    # Path is always a plain string path (see Get-CommandPath) so callers can
+    # hand it straight to Start-Process -FilePath on PS 5.1 and PS 7.
+    $pythonCmd = Get-CommandPath "python.exe"
+    if ($pythonCmd -and $pythonCmd -notlike "*WindowsApps*" -and
+        (Test-PythonProbe $pythonCmd @())) {
+        return @{ Path = $pythonCmd; Extra = @() }
     }
-    $pyCmd = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($pyCmd -and (Test-PythonProbe $pyCmd.Source @("-3"))) {
-        return @{ Path = $pyCmd.Source; Extra = @("-3") }
+    $pyCmd = Get-CommandPath "py.exe"
+    if ($pyCmd -and (Test-PythonProbe $pyCmd @("-3"))) {
+        return @{ Path = $pyCmd; Extra = @("-3") }
     }
     # per-user python.org installs may not be on PATH yet; probe them directly
     # (optional probe: skipped when LOCALAPPDATA is missing, never Join-Path'd
@@ -257,10 +304,10 @@ function Ensure-Python {
     Write-Info "Python 3.8+ not found; attempting an automatic per-user install (no admin/UAC)"
 
     # 1) winget, user scope only - never asks for machine-wide elevation
-    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    $winget = Get-CommandPath "winget.exe"
     if ($winget) {
         Write-Info "trying winget: install -e --id Python.Python.3.12 --scope user (silent)"
-        & $winget.Source install -e --id Python.Python.3.12 --scope user --silent `
+        & $winget install -e --id Python.Python.3.12 --scope user --silent `
             --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0) { Refresh-PathFromRegistry }
         $python = Get-PythonCommand
@@ -284,7 +331,8 @@ function Ensure-Python {
                 Write-Fail "python.org installer exited with code $($installProc.ExitCode)"
             }
         } catch {
-            Write-Fail "automatic Python install failed: $_"
+            Write-Fail "automatic Python install failed; details:"
+            Write-FailDetail $_
         } finally {
             Refresh-PathFromRegistry
         }
@@ -318,16 +366,16 @@ function Find-Codex {
         $npmShim = Join-Path $appData.Trim() "npm\codex.cmd"
         if (Test-Path -LiteralPath $npmShim) { return $npmShim }
     }
-    $native = Get-Command codex.exe -ErrorAction SilentlyContinue
-    if ($native) { return $native.Source }
+    $native = Get-CommandPath "codex.exe"
+    if ($native) { return $native }
     # official native installer default location (may not be on PATH yet)
     $userProfile = [Environment]::GetEnvironmentVariable("USERPROFILE", "Process")
     if (-not [string]::IsNullOrWhiteSpace($userProfile)) {
         $nativeLocal = Join-Path $userProfile.Trim() ".local\bin\codex.exe"
         if (Test-Path -LiteralPath $nativeLocal) { return $nativeLocal }
     }
-    $shim = Get-Command codex.cmd -ErrorAction SilentlyContinue
-    if ($shim) { return $shim.Source }
+    $shim = Get-CommandPath "codex.cmd"
+    if ($shim) { return $shim }
     return $null
 }
 
@@ -339,10 +387,10 @@ function Ensure-Codex {
     }
     if (-not $SkipAutoInstall) {
         # 1) npm global install (user prefix %APPDATA%\npm, no admin)
-        $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+        $npm = Get-CommandPath "npm.cmd"
         if ($npm) {
             Write-Info "codex not found; installing @openai/codex via npm (user prefix, no admin needed)"
-            & $npm.Source install -g "@openai/codex"
+            & $npm install -g "@openai/codex"
             if ($LASTEXITCODE -eq 0) {
                 $codexBin = Find-Codex
                 if ($codexBin) {
@@ -385,8 +433,8 @@ function Get-NgrokExe {
         Write-Fail "NGROK_BIN is set but not found: $env:NGROK_BIN"
         return $null
     }
-    $cmd = Get-Command ngrok.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
+    $cmd = Get-CommandPath "ngrok.exe"
+    if ($cmd) { return $cmd }
     $localAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA", "Process")
     if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
         $local = Join-Path $localAppData.Trim() "ngrok\ngrok.exe"
@@ -661,10 +709,31 @@ function Ensure-Bridge {
         "--codex-home", "`"$script:CodexHome`"",
         "--log", "`"$script:BridgeLog`"")
     Write-Info "starting bridge: python -m http_server on $($script:BaseUrl) (codex home: $script:CodexHome)"
-    $proc = Start-Process -FilePath $python.Path -ArgumentList (@($python.Extra) + $bridgeArgs) `
-        -WorkingDirectory $script:RepoRoot -WindowStyle Hidden `
-        -RedirectStandardOutput $script:BridgeOutLog -RedirectStandardError $script:BridgeErrLog `
-        -PassThru
+    # $python.Path is our own plain-string descriptor (built by
+    # Get-CommandPath); Start-Process receives a [string] and no .Path is ever
+    # read back off the returned Process object. On Windows PowerShell 5.1 a
+    # child that exits before -PassThru returns its wrapper surfaces as a
+    # spurious "Property 'Path' cannot be found on this object" error (PS
+    # 7.2.8+ instead returns an exited Process); both shapes are handled the
+    # same way below - never write a pid file for a process that is gone.
+    $pythonPath = [string]$python.Path
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $pythonPath -ArgumentList (@($python.Extra) + $bridgeArgs) `
+            -WorkingDirectory $script:RepoRoot -WindowStyle Hidden `
+            -RedirectStandardOutput $script:BridgeOutLog -RedirectStandardError $script:BridgeErrLog `
+            -PassThru
+    } catch {
+        $startError = $_
+        Write-Fail "the bridge process failed to start (a child that exits immediately surfaces on Windows PowerShell 5.1 as a spurious 'property Path not found' error from Start-Process)"
+        Show-BridgeLogTail
+        Write-FailDetail $startError
+        Exit-With 5
+    }
+    if ($proc.HasExited) {
+        Show-BridgeLogTail
+        Exit-With 5 "the bridge process exited immediately (exit code: $($proc.ExitCode)); see the log tails above"
+    }
     Restore-Env
     [System.IO.File]::WriteAllText($script:BridgePidFile, "$($proc.Id)")
     $script:StartedBridgeNow = $true
@@ -680,7 +749,7 @@ function Wait-LocalHealth {
         if ($health -and $health.ready -eq $true -and $health.status -eq "ok") { break }
         if ($script:StartedBridgeNow) {
             $bridgeProc = Get-Process -Id $script:BridgePid -ErrorAction SilentlyContinue
-            if (-not $bridgeProc -and -not ($python.Path -like "*py.exe")) { break }
+            if (-not $bridgeProc -and -not ([string]$python.Path -like "*py.exe")) { break }
         }
         Start-Sleep -Seconds 1
     }
@@ -871,11 +940,24 @@ function Invoke-NgrokPhase {
     }
 
     Write-Info "starting ngrok: $ngrokExe http $($script:Port) --url https://$tunnelDomain"
-    $ngrokProc = Start-Process -FilePath $ngrokExe `
-        -ArgumentList @("http", "$($script:Port)", "--url", "https://$tunnelDomain") `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $script:NgrokOutLog -RedirectStandardError $script:NgrokErrLog `
-        -PassThru
+    $ngrokProc = $null
+    try {
+        $ngrokProc = Start-Process -FilePath $ngrokExe `
+            -ArgumentList @("http", "$($script:Port)", "--url", "https://$tunnelDomain") `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $script:NgrokOutLog -RedirectStandardError $script:NgrokErrLog `
+            -PassThru
+    } catch {
+        $startError = $_
+        Write-Fail "ngrok failed to start (a child that exits immediately surfaces on Windows PowerShell 5.1 as a spurious 'property Path not found' error from Start-Process)"
+        Show-NgrokLogTail
+        Write-FailDetail $startError
+        Exit-With 6
+    }
+    if ($ngrokProc.HasExited) {
+        Show-NgrokLogTail
+        Exit-With 6 "ngrok exited immediately (exit code: $($ngrokProc.ExitCode)); see the log tails above"
+    }
     [System.IO.File]::WriteAllText($script:NgrokPidFile, "$($ngrokProc.Id)")
     $script:StartedNgrokNow = $true
     $script:NgrokPid = $ngrokProc.Id
@@ -978,7 +1060,7 @@ try {
         Write-Host "============================================================"
     }
 } catch {
-    Write-Fail $_
+    Write-FailDetail $_
     Stop-StartedChildren
     exit 1
 }

@@ -48,6 +48,24 @@
   BRIDGE_STATE_ROOT/XDG_STATE_HOME/CODEX_HOME）逐一显式校验，空值给出
   可诊断错误并补充 6 项静态回归测试；macOS 行为零改动。
 
+- **Windows PowerShell 5.1 启动回归修复（windows-bootstrap 第四次提交，脚本
+  版本 `windows-bootstrap-1.0.3`）**：`-NoNgrok` 走到 `starting bridge: ...`
+  后立即报“在此对象上找不到属性‘Path’”并退出——Windows PowerShell 5.1 的
+  `Start-Process -PassThru` 在子进程于返回 wrapper 前即退出时会抛该伪
+  `.Path` 属性错误（PS 7.2.8+ 改为返回一个已退出 Process，两种形态此前都会
+  让 bridge/ngrok 启动路径异常失败）。修复：全部外部命令解析收敛到新增的
+  `Get-CommandPath`——只读 `Source`/`Definition` 字符串并带安全 fallback，
+  返回纯字符串路径，任何调用点都不再依赖 CommandInfo/Process 返回对象上
+  并非各版本都存在的 `.Path`；bridge 与 ngrok 的 `Start-Process -PassThru`
+  均以 try/catch 包裹，写 pid 前先查 `HasExited`，子进程秒退时直接展示
+  进程日志并以原错误码退出，不再写入死进程 pid；新增 `Write-FailDetail`
+  供 catch 输出异常信息 + 脚本文件/行号 + PowerShell 调用栈（只输出位置与
+  栈文本，绝不回显参数行/env 值，无 secret 泄露面），主 catch、python
+  安装 catch、bridge/ngrok 启动 catch 统一走该诊断输出。tests/
+  test_windows_support.py 增至 46 项（41 项任意平台 + 5 项 Windows-only），
+  其中新增 4 项静态回归测试覆盖命令字符串解析、bridge/ngrok 秒退守卫与
+  catch 诊断；macOS 行为零改动。
+
 ## [1.1.0] - 2026-08-14
 
 > 状态：**已发布（2026-08-14）**。tag `v1.1.0` 指向本次 release commit；

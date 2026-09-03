@@ -16,6 +16,7 @@ python3 tests/test_workspace_guard.py
 python3 tests/test_git_automation.py
 python3 tests/test_migrate_codex_home_permissions.py
 python3 tests/test_pid_guard.py
+python3 tests/test_windows_support.py   # Windows 支持：纯函数 + 平台条件 + PS 脚本静态检查
 ```
 
 可选集成验证（需要 macOS Seatbelt + 普通 Terminal，不在 CI 运行）：

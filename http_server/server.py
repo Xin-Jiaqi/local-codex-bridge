@@ -249,6 +249,75 @@ CONFIG_OVERRIDES = build_config_overrides({})
 VALID_INSTANCES = ("local", "hpc", "maintenance")
 
 
+def _platform_home(env):
+    """Effective $HOME for the cwd guard. Windows runs (os.name == "nt")
+    prefer %USERPROFILE% (plain PowerShell does not set $HOME); macOS keeps
+    $HOME exactly as before."""
+    if os.name == "nt":
+        return env.get("USERPROFILE") or env.get("HOME") or os.path.expanduser("~")
+    return env.get("HOME") or os.path.expanduser("~")
+
+
+def _state_root_base(env, home):
+    r"""Base state dir (already including the local-codex-bridge segment).
+
+    macOS: ${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge (unchanged).
+    Windows: %LOCALAPPDATA%\local-codex-bridge (the per-user AppData state
+    home); BRIDGE_STATE_ROOT and XDG_STATE_HOME overrides keep working.
+    """
+    xdg = env.get("XDG_STATE_HOME")
+    if os.name == "nt":
+        if xdg:
+            return os.path.join(xdg, "local-codex-bridge")
+        try:
+            return _windows_defaults(env)["state_root_base"]
+        except ValueError:
+            return os.path.join(home, ".local", "state", "local-codex-bridge")
+    return os.path.join(xdg or os.path.join(home, ".local", "state"), "local-codex-bridge")
+
+
+def _windows_defaults(env):
+    from bridge.platform_paths import windows_defaults
+    return windows_defaults(env)
+
+
+def default_codex_home(env=None):
+    r"""CODEX_HOME default for the spawned app-server: macOS keeps the
+    dedicated bridge profile (~/.codex-deepseek); Windows uses the plain
+    %USERPROFILE%\.codex profile (DeepSeek provider config copied there)."""
+    env = os.environ if env is None else env
+    if os.name == "nt":
+        return _windows_defaults(env)["codex_home"]
+    return os.path.expanduser("~/.codex-deepseek")
+
+
+def default_codex_bin(env=None):
+    r"""Resolve the codex executable for --codex-bin when not configured.
+
+    macOS keeps the historic PATH lookup (bare "codex"). Windows auto-detects
+    %APPDATA%\npm\codex.cmd (npm) or a native codex.exe on PATH and exits
+    with an actionable error when none is installed.
+    """
+    env = os.environ if env is None else env
+    if os.name != "nt":
+        return "codex"
+    from bridge.platform_paths import detect_codex_binary
+    try:
+        found = detect_codex_binary(env)
+    except ValueError:
+        found = None
+    if found:
+        return found
+    print(
+        "error: codex not found on this Windows machine (set CODEX_BIN, or "
+        "install the Codex CLI: npm install -g @openai/codex, or the native "
+        'installer "powershell -ExecutionPolicy ByPass -c '
+        '\"irm https://chatgpt.com/codex/install.ps1 | iex\"")',
+        file=os.sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 def build_cwd_guard(env=None):
     """Build the task-cwd guard paths for the pinned instance (or legacy).
 
@@ -262,19 +331,20 @@ def build_cwd_guard(env=None):
     the task guard unchanged. All paths are canonicalized by the validator.
     """
     env = os.environ if env is None else env
-    home = env.get("HOME") or os.path.expanduser("~")
+    home = _platform_home(env)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     state_root = None
     instance = (env.get("BRIDGE_INSTANCE") or "").strip().lower()
     if instance in VALID_INSTANCES:
-        base = env.get("BRIDGE_STATE_ROOT") or os.path.join(
-            env.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
-            "local-codex-bridge",
-        )
+        base = env.get("BRIDGE_STATE_ROOT") or _state_root_base(env, home)
         state_root = os.path.join(base, instance)
     codex_home = env.get("CODEX_HOME")
     if not codex_home:
-        if instance == "maintenance":
+        if os.name == "nt":
+            # Windows bootstrap profile (local instance only): the user keeps
+            # the existing DeepSeek provider config in %USERPROFILE%\.codex.
+            codex_home = _windows_defaults(env)["codex_home"]
+        elif instance == "maintenance":
             codex_home = os.path.join(home, ".codex-deepseek-maintenance")
         else:
             codex_home = os.path.join(home, ".codex-deepseek")
@@ -694,13 +764,12 @@ def main():
     parser = argparse.ArgumentParser(description="Local Codex Bridge HTTP API")
     parser.add_argument("--host", default=os.environ.get("BRIDGE_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=default_port)
-    parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
-    parser.add_argument(
-        "--codex-home",
-        default=os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex-deepseek"),
-    )
+    parser.add_argument("--codex-bin", default=None)
+    parser.add_argument("--codex-home", default=None)
     parser.add_argument("--log", default="http_server.log")
     args = parser.parse_args()
+    codex_bin = args.codex_bin or os.environ.get("CODEX_BIN") or default_codex_bin()
+    codex_home = args.codex_home or os.environ.get("CODEX_HOME") or default_codex_home()
 
     api_key = os.environ.get("BRIDGE_API_KEY", "")
     if not api_key:
@@ -713,7 +782,7 @@ def main():
         print("error: %s" % e, file=os.sys.stderr)
         raise SystemExit(2)
     if any(o.startswith('default_permissions="%s"' % BRIDGE_PERMISSION_PROFILE) for o in config_overrides):
-        _guard_bridge_workspace_home(args.codex_home)
+        _guard_bridge_workspace_home(codex_home)
     child_env = build_child_env(os.environ, config_overrides)
 
     log = Logger(args.log, echo=True)
@@ -722,8 +791,8 @@ def main():
         instance = None
     mode = os.environ.get("BRIDGE_SANDBOX_MODE") or None
     server = BridgeHttpServer(
-        args.codex_bin,
-        args.codex_home,
+        codex_bin,
+        codex_home,
         api_key,
         host=args.host,
         port=args.port,

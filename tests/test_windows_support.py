@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""Offline tests for the Windows bootstrap support (windows-bootstrap).
+
+Covers, without any live bridge / app-server / network / secret:
+
+PART 1 (runs on every host): bridge/platform_paths.py pure resolution -
+Windows profile/defaults (CODEX_HOME=%USERPROFILE%\\.codex, state root
+%LOCALAPPDATA%\\local-codex-bridge, work root D:\\work-of-jiaqi), codex
+detection order (CODEX_BIN > %APPDATA%\\npm\\codex.cmd > codex.exe on PATH
+> codex.cmd on PATH), npm codex.cmd shim resolution to node + the real JS
+entry (embedded-quote argv survives because cmd.exe is bypassed), and the
+macOS spawn argv staying byte-identical.
+
+PART 2 (platform-conditional, runs only when os.name == "nt"): the cwd
+guard on a real Windows filesystem - case-insensitive control-plane
+rejections, drive-root semantics, and acceptance of the default Windows work
+root D:\\work-of-jiaqi.
+
+PART 3 (runs on every host): structural checks of
+scripts/windows/start_local_codex_bridge.ps1 - preparation mode (-NoNgrok),
+fixed-domain default, local /health + /ready gates before the ngrok phase,
+and that secrets (API key / ngrok authtoken) are never echoed or written.
+"""
+
+import json
+import os
+import re
+import sys
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from bridge.platform_paths import (
+    CodexSpawnResolutionError,
+    codex_argv_head,
+    detect_codex_binary,
+    resolve_codex_shim,
+    windows_codex_candidates,
+    windows_defaults,
+    windows_profile,
+)
+from bridge.workspace_guard import TaskCwdError, validate_task_cwd
+from http_server.server import build_cwd_guard
+
+WIN_ENV = {
+    "USERPROFILE": r"C:\Users\Jiaqi",
+    "APPDATA": r"C:\Users\Jiaqi\AppData\Roaming",
+    "LOCALAPPDATA": r"C:\Users\Jiaqi\AppData\Local",
+    "PATH": r"C:\Windows\system32;C:\Windows",
+}
+
+NPM_SHIM = r"C:\Users\Jiaqi\AppData\Roaming\npm\codex.cmd"
+NPM_PKG = r"C:\Users\Jiaqi\AppData\Roaming\npm\node_modules\@openai\codex\package.json"
+NPM_ENTRY = r"C:\Users\Jiaqi\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js"
+NODE = r"C:\Program Files\nodejs\node.exe"
+NATIVE_EXE = r"C:\Users\Jiaqi\.local\bin\codex.exe"
+
+
+def fake_which(name, path=None):
+    if name == "node.exe":
+        return NODE
+    if name == "codex.exe":
+        return NATIVE_EXE
+    return None
+
+
+class WindowsDefaultsTest(unittest.TestCase):
+    """Part 1a: platform_paths defaults (pure, runs on any host)."""
+
+    def test_profile_uses_windows_env(self):
+        profile = windows_profile(WIN_ENV)
+        self.assertEqual(profile["userprofile"], r"C:\Users\Jiaqi")
+        self.assertEqual(
+            profile["appdata"], r"C:\Users\Jiaqi\AppData\Roaming"
+        )
+        self.assertEqual(
+            profile["localappdata"], r"C:\Users\Jiaqi\AppData\Local"
+        )
+
+    def test_profile_falls_back_under_userprofile(self):
+        profile = windows_profile({"USERPROFILE": r"C:\Users\X"})
+        self.assertEqual(
+            profile["localappdata"], r"C:\Users\X\AppData\Local"
+        )
+        self.assertEqual(
+            profile["appdata"], r"C:\Users\X\AppData\Roaming"
+        )
+
+    def test_profile_requires_userprofile(self):
+        with self.assertRaises(ValueError):
+            windows_profile({"APPDATA": r"C:\a", "LOCALAPPDATA": r"C:\l"})
+
+    def test_windows_defaults_codex_home_and_state_root(self):
+        defaults = windows_defaults(WIN_ENV)
+        self.assertEqual(defaults["codex_home"], r"C:\Users\Jiaqi\.codex")
+        self.assertEqual(
+            defaults["state_root_base"],
+            r"C:\Users\Jiaqi\AppData\Local\local-codex-bridge",
+        )
+        self.assertEqual(defaults["work_root"], r"D:\work-of-jiaqi")
+
+    def test_windows_defaults_overrides(self):
+        env = dict(WIN_ENV, BRIDGE_WORK_ROOT=r"E:\work", XDG_STATE_HOME=r"D:\state")
+        defaults = windows_defaults(env)
+        self.assertEqual(defaults["work_root"], r"E:\work")
+        self.assertEqual(
+            defaults["state_root_base"], r"D:\state\local-codex-bridge"
+        )
+
+
+class CodexDetectionTest(unittest.TestCase):
+    """Part 1b: codex executable detection (pure, runs on any host)."""
+
+    def test_env_override_wins(self):
+        env = dict(WIN_ENV, CODEX_BIN=r"C:\tools\codex.exe")
+        found = detect_codex_binary(env, isfile=lambda p: p == r"C:\tools\codex.exe")
+        self.assertEqual(found, r"C:\tools\codex.exe")
+
+    def test_npm_shim_second(self):
+        found = detect_codex_binary(
+            WIN_ENV, isfile=lambda p: p == NPM_SHIM
+        )
+        self.assertEqual(found, NPM_SHIM)
+
+    def test_native_exe_on_path_after_npm_shim(self):
+        # npm shim absent -> codex.exe on PATH wins over codex.cmd/bare codex
+        env = dict(WIN_ENV, PATH=r"C:\Users\Jiaqi\.local\bin")
+        calls = []
+
+        def which(name, path=None):
+            calls.append(name)
+            if name == "codex.exe":
+                return NATIVE_EXE
+            return None
+
+        found = detect_codex_binary(env, isfile=lambda p: False, which=which)
+        self.assertEqual(found, NATIVE_EXE)
+        self.assertEqual(calls, ["codex.exe"])
+
+    def test_path_fallback_order(self):
+        # No native exe -> codex.cmd on PATH -> bare codex last.
+        env = dict(WIN_ENV, PATH=r"C:\tools")
+        npm_codex_cmd = r"C:\tools\codex.cmd"
+
+        def which(name, path=None):
+            if name == "codex.exe":
+                return None
+            if name == "codex.cmd":
+                return npm_codex_cmd
+            if name == "codex":
+                return r"C:\tools\codex"
+            return None
+
+        found = detect_codex_binary(env, isfile=lambda p: False, which=which)
+        self.assertEqual(found, npm_codex_cmd)
+
+    def test_invalid_override_falls_through(self):
+        env = dict(WIN_ENV, CODEX_BIN=r"C:\missing\codex.exe")
+        found = detect_codex_binary(env, isfile=lambda p: p == NPM_SHIM)
+        self.assertEqual(found, NPM_SHIM)
+
+    def test_none_when_everything_missing(self):
+        self.assertIsNone(
+            detect_codex_binary(WIN_ENV, isfile=lambda p: False, which=lambda n, path=None: None)
+        )
+
+    def test_candidates_do_not_touch_filesystem(self):
+        candidates = windows_codex_candidates(WIN_ENV)
+        self.assertEqual(
+            candidates, [r"C:\Users\Jiaqi\AppData\Roaming\npm\codex.cmd"]
+        )
+
+
+class NpmShimResolutionTest(unittest.TestCase):
+    """Part 1c: codex.cmd -> node + JS entry resolution (pure)."""
+
+    FILES = {
+        NPM_SHIM: True,
+        NPM_PKG: True,
+        NPM_ENTRY: True,
+        NODE: True,
+    }
+    TEXTS = {NPM_PKG: json.dumps({"bin": {"codex": "bin/codex.js"}})}
+
+    def isfile(self, path):
+        return path in self.FILES
+
+    def read_text(self, path):
+        if path not in self.TEXTS:
+            raise AssertionError("unexpected file read: %s" % path)
+        return self.TEXTS[path]
+
+    def test_shim_resolves_to_node_plus_entry(self):
+        argv = codex_argv_head(
+            NPM_SHIM,
+            ["app-server", "--listen", "stdio://", "-c", 'model="deepseek-chat"'],
+            env=WIN_ENV,
+            os_name="nt",
+            isfile=self.isfile,
+            which=fake_which,
+            read_text=self.read_text,
+        )
+        self.assertEqual(
+            argv,
+            [NODE, NPM_ENTRY, "app-server", "--listen", "stdio://",
+             "-c", 'model="deepseek-chat"'],
+        )
+
+    def test_shim_prefers_adjacent_node_exe(self):
+        adjacent = r"C:\Users\Jiaqi\AppData\Roaming\npm\node.exe"
+        self.FILES[adjacent] = True
+        try:
+            argv = codex_argv_head(
+                NPM_SHIM, ["app-server"], env=WIN_ENV, os_name="nt",
+                isfile=self.isfile, which=fake_which, read_text=self.read_text,
+            )
+            self.assertEqual(argv, [adjacent, NPM_ENTRY, "app-server"])
+        finally:
+            del self.FILES[adjacent]
+
+    def test_packaged_native_exe_bin(self):
+        pkg_exe = r"C:\Users\Jiaqi\AppData\Roaming\npm\node_modules\@openai\codex\codex.exe"
+        files = dict(self.FILES, **{pkg_exe: True})
+        texts = dict(self.TEXTS, **{NPM_PKG: json.dumps({"bin": "codex.exe"})})
+        argv = codex_argv_head(
+            NPM_SHIM, ["app-server"], env=WIN_ENV, os_name="nt",
+            isfile=files.__contains__, which=fake_which,
+            read_text=texts.__getitem__,
+        )
+        self.assertEqual(argv, [pkg_exe, "app-server"])
+
+    def test_unresolvable_shim_raises_actionable_error(self):
+        with self.assertRaises(CodexSpawnResolutionError) as ctx:
+            codex_argv_head(
+                NPM_SHIM, ["app-server"], env=WIN_ENV, os_name="nt",
+                isfile=lambda p: p == NPM_SHIM, which=fake_which,
+                read_text=lambda p: "",
+            )
+        message = str(ctx.exception)
+        self.assertIn("npm", message)
+        self.assertIn("chatgpt.com/codex/install.ps1", message)
+
+    def test_resolve_shim_none_without_package(self):
+        self.assertIsNone(
+            resolve_codex_shim(
+                r"C:\x\codex.cmd", env=WIN_ENV,
+                isfile=lambda p: False, which=fake_which,
+            )
+        )
+
+
+class SpawnArgvParityTest(unittest.TestCase):
+    """Part 1d: macOS spawn argv stays byte-identical."""
+
+    def test_posix_branch_is_unchanged(self):
+        extra = ["app-server", "--listen", "stdio://", "-c", 'model="deepseek-chat"']
+        self.assertEqual(
+            codex_argv_head("/opt/homebrew/bin/codex", extra),
+            ["/opt/homebrew/bin/codex"] + extra,
+        )
+
+    def test_windows_exe_is_spawned_directly(self):
+        argv = codex_argv_head(
+            r"C:\tools\codex.exe", ["app-server", "-c", 'model="deepseek-chat"'],
+            os_name="nt",
+        )
+        self.assertEqual(
+            argv,
+            [r"C:\tools\codex.exe", "app-server", "-c", 'model="deepseek-chat"'],
+        )
+
+
+@unittest.skipUnless(os.name == "nt", "runs only on a real Windows host")
+class WindowsCwdGuardTest(unittest.TestCase):
+    """Part 2: cwd guard semantics on Windows (case-insensitive FS)."""
+
+    def _layout(self):
+        import tempfile
+        base = tempfile.mkdtemp(prefix="lcb-win-")
+        layout = {}
+        for key in ("home", "repo", "state", "codex"):
+            layout[key] = os.path.join(base, key)
+            os.makedirs(layout[key])
+        layout["work"] = os.path.join(base, "work-of-jiaqi")
+        os.makedirs(layout["work"])
+        layout["base"] = base
+        return layout
+
+    def _guard(self, layout):
+        return {
+            "home": layout["home"],
+            "repo_root": layout["repo"],
+            "state_root": layout["state"],
+            "codex_home": layout["codex"],
+        }
+
+    def test_case_variant_of_home_is_rejected(self):
+        layout = self._layout()
+        try:
+            cwd = os.path.join(layout["home"].upper(), "Desktop", "proj")
+            os.makedirs(cwd)
+            with self.assertRaises(TaskCwdError) as ctx:
+                validate_task_cwd(cwd, **self._guard(layout))
+            self.assertEqual(ctx.exception.category, "home")
+        finally:
+            import shutil
+            shutil.rmtree(layout["base"], ignore_errors=True)
+
+    def test_drive_root_is_ancestor_of_home_on_same_drive(self):
+        layout = self._layout()
+        try:
+            home_drive = os.path.splitdrive(layout["home"])[0] + os.sep
+            with self.assertRaises(TaskCwdError) as ctx:
+                validate_task_cwd(home_drive, **self._guard(layout))
+            self.assertEqual(ctx.exception.category, "home")
+        finally:
+            import shutil
+            shutil.rmtree(layout["base"], ignore_errors=True)
+
+    def test_case_variant_of_codex_home_is_rejected(self):
+        layout = self._layout()
+        try:
+            cwd = layout["codex"].upper()
+            if not os.path.exists(cwd):
+                cwd = layout["codex"]
+            with self.assertRaises(TaskCwdError) as ctx:
+                validate_task_cwd(cwd, **self._guard(layout))
+            self.assertEqual(ctx.exception.category, "codex_home")
+        finally:
+            import shutil
+            shutil.rmtree(layout["base"], ignore_errors=True)
+
+    def test_default_windows_work_root_subdir_is_accepted(self):
+        # D:\work-of-jiaqi is an ordinary project volume outside the control
+        # plane; acceptance must not depend on the drive letter spelling.
+        cwd = os.path.join(r"D:\work-of-jiaqi", "some-project")
+        canonical = validate_task_cwd(cwd, home=r"C:\Users\bridge-user",
+                                      repo_root=r"C:\Users\bridge-user\repo",
+                                      state_root=r"C:\Users\bridge-user\repo-state",
+                                      codex_home=r"C:\Users\bridge-user\.codex")
+        self.assertTrue(canonical.lower().startswith(r"d:\work-of-jiaqi"))
+
+    def test_build_cwd_guard_windows_defaults(self):
+        env = {
+            "USERPROFILE": r"C:\Users\Jiaqi",
+            "LOCALAPPDATA": r"C:\Users\Jiaqi\AppData\Local",
+            "BRIDGE_INSTANCE": "local",
+            "BRIDGE_SANDBOX_MODE": "workspace-write",
+        }
+        guard = build_cwd_guard(env)
+        self.assertEqual(guard["home"], r"C:\Users\Jiaqi")
+        self.assertEqual(guard["codex_home"], r"C:\Users\Jiaqi\.codex")
+        self.assertEqual(
+            guard["state_root"],
+            r"C:\Users\Jiaqi\AppData\Local\local-codex-bridge\local",
+        )
+
+
+class BootstrapScriptStructuralTest(unittest.TestCase):
+    """Part 3: PowerShell bootstrap structural/secret-surface checks."""
+
+    @classmethod
+    def setUpClass(cls):
+        script = os.path.join(ROOT, "scripts", "windows",
+                              "start_local_codex_bridge.ps1")
+        with open(script, encoding="utf-8") as fh:
+            cls.source = fh.read()
+        cls.lines = cls.source.splitlines()
+
+    def test_script_exists_and_has_param_switches(self):
+        self.assertGreater(len(self.source), 3000)
+        self.assertIn("[switch]$NoNgrok", self.source)
+        self.assertIn("[switch]$Stop", self.source)
+        self.assertIn("-NoNgrok", self.source)
+        self.assertIn("-ExecutionPolicy Bypass", self.source)
+
+    def test_fixed_domain_default_and_overrides(self):
+        self.assertIn(
+            '$script:FixedDomainDefault = "diploma-ideology-skier.ngrok-free.dev"',
+            self.source,
+        )
+        self.assertIn("$env:NGROK_DOMAIN", self.source)
+        self.assertIn("[string]$Domain", self.source)
+
+    def test_windows_defaults_present(self):
+        self.assertIn('$WorkRoot = "D:\\work-of-jiaqi"', self.source)
+        self.assertIn('Join-Path $env:USERPROFILE ".codex"', self.source)
+        self.assertIn('$env:APPDATA "npm\\codex.cmd"', self.source)
+
+    def test_local_health_and_ready_verified_before_ngrok_phase(self):
+        wait_health = self.source.index("function Wait-LocalHealth")
+        ready_check = self.source.index('Get-HealthJson "/ready"')
+        bridge_phase = self.source.index("function Invoke-BridgePhase")
+        ngrok_phase = self.source.index("function Invoke-NgrokPhase")
+        start_ngrok = self.source.index("starting ngrok:")
+        self.assertLess(wait_health, ready_check)
+        self.assertLess(ready_check, bridge_phase)
+        self.assertLess(bridge_phase, ngrok_phase)
+        self.assertLess(ngrok_phase, start_ngrok)
+        # the local verification must run before ngrok can start in main too
+        main_ngrok = self.source.index("Invoke-NgrokPhase", bridge_phase)
+        self.assertLess(
+            self.source.index("Wait-LocalHealth", bridge_phase), main_ngrok
+        )
+        self.assertIn("Get-HealthJson \"/health\"", self.source)
+        self.assertIn("Get-HealthJson \"/ready\"", self.source)
+
+    def test_secret_values_are_never_echoed_or_written(self):
+        echoing = re.compile(
+            r"^\s*(Write-Host|Write-Info|Write-Fail|Write-Output|Write-Error|"
+            r"Out-File|Set-Content|Add-Content|ConvertTo-Json).*", re.I
+        )
+        forbidden = []
+        for lineno, line in enumerate(self.lines, 1):
+            if not echoing.match(line):
+                continue
+            if ("$env:BRIDGE_API_KEY" in line or "$env:NGROK_AUTHTOKEN" in line
+                    or "$env:DEEPSEEK_API_KEY" in line):
+                forbidden.append((lineno, line.strip()))
+        self.assertEqual(forbidden, [])
+
+    def test_secrets_never_written_to_logs_or_pid_files(self):
+        for lineno, line in enumerate(self.lines, 1):
+            low = line.lower()
+            if ("bridgeapikey" in low or "ngrokauthtoken" in low
+                    or "deepseekapikey" in low) and (
+                    "out-file" in low or "add-content" in low or "set-content" in low):
+                self.fail("secret written to a file at line %d: %s"
+                          % (lineno, line.strip()))
+
+    def test_ngrok_token_never_passed_on_command_line(self):
+        # The script must rely on NGROK_AUTHTOKEN env / existing config only.
+        ngrok_start = self.source.index("starting ngrok:")
+        segment = self.source[ngrok_start:ngrok_start + 600]
+        self.assertNotIn("--authtoken", segment)
+        self.assertNotIn("add-authtoken", segment)
+        self.assertIn("--url", segment)
+
+    def test_api_key_read_into_env_only(self):
+        # .bridge_api_key is loaded with ReadAllText into BRIDGE_API_KEY env
+        # for the child process; never Get-Content'd into console output.
+        self.assertIn("[System.IO.File]::ReadAllText($script:KeyFile)", self.source)
+        self.assertNotIn("Get-Content", self.source.split("function Ensure-SecretEnvironment")[0])
+        for lineno, line in enumerate(self.lines, 1):
+            if "Get-Content" in line and "bridge_api_key" not in line.lower():
+                # Get-Content is only used for pid-file summaries, never keys
+                continue
+            if "Get-Content" in line and "bridge_api_key" in line.lower():
+                self.fail("key file read via Get-Content at line %d" % lineno)
+
+
+if __name__ == "__main__":
+    unittest.main()

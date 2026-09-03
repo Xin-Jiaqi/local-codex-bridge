@@ -3,6 +3,27 @@
 1.0.0 之前的条目根据本地源码与 2026-08-11 测试报告重建，日期为近似值；
 仓库自 2026-08-12 起纳入 git 管理（v1.0.0，分支 `main`）。
 
+## [Unreleased]
+
+> 状态：分支 `windows-bootstrap` 上的 Windows 扩展，未发布、未 push 到
+> origin；main / v1.1.0 行为不变。HTTP API 无任何改动。
+
+- **Windows 原生 bootstrap（windows-bootstrap）**：PowerShell + Windows Python
+  + Windows Codex CLI，不改协议；默认工作根 `D:\work-of-jiaqi`、CODEX_HOME
+  `%USERPROFILE%\.codex`（复用现有 DeepSeek provider 配置）、codex 自动探测
+  `%APPDATA%\npm\codex.cmd` / 原生 `codex.exe`、实例状态
+  `%LOCALAPPDATA%\local-codex-bridge\local\`。新增
+  `scripts/windows/start_local_codex_bridge.ps1`（依赖检查/最小安装、`-NoNgrok`
+  准备模式、起 bridge 前强制验证本地 `/health` + `/ready`、ngrok 固定域名
+  cutover 可选步骤、`-Stop` 只停本脚本进程；secret 不入日志）。
+- **跨平台路径与 spawn**：`bridge/platform_paths.py` 纯函数解析 Windows 默认
+  路径；`codex.cmd`（npm shim）经 node + 包内 JS entry 直启，绕开 cmd.exe 对
+  带引号 `-c` 参数的重解析；`workspace_guard` 在 Windows 下按大小写不敏感与
+  盘符根比较（macOS 逐字节不变）。
+- **测试/CI**：`tests/test_windows_support.py` 32 项（27 项任意平台 + 5 项
+  Windows-only 平台条件测试 + PowerShell 静态 secret 面检查），已加入离线
+  CI 集合与 py_compile。
+
 ## [1.1.0] - 2026-08-14
 
 > 状态：**已发布（2026-08-14）**。tag `v1.1.0` 指向本次 release commit；

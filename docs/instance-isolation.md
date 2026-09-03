@@ -274,3 +274,20 @@ local` → `install_launch_agent.sh --instance local` → `status_launch_agent.s
 --instance local`。**launchd 实机装载未在 maintenance 沙箱会话执行**（
 `~/.local/share` 写权限在沙箱外）；实现与 temp-dir 离线测试已交付，8 项
 supervisor live 测试需 `ps`（CI/普通终端运行）。
+
+## Windows 侧（windows-bootstrap 分支）
+
+Windows 原生 bootstrap 只部署 `local` 实例语义，控制面/任务面隔离不变：
+
+- 状态根在仓库外：`%LOCALAPPDATA%\local-codex-bridge\local\`（对应 macOS
+  `${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge/local/`）；目录里
+  只有非 secret 字段（`instance.json`：name/mode/approval/network/host/port/
+  codex_home/codex_bin/work_root/路径引用）与 PID/日志，任何 secret 值不进
+  状态文件。
+- `BRIDGE_INSTANCE=local` 由 `start_local_codex_bridge.ps1` 在进程启动时钉扎
+  （env 注入），任务 API 没有切换实例的入口；`build_cwd_guard` 在 Windows 下
+  默认 `home=%USERPROFILE%`、`state_root=%LOCALAPPDATA%\local-codex-bridge\
+  local`、`codex_home=%USERPROFILE%\.codex`，任务 cwd 守卫照常拒绝
+  HOME/仓库/状态根/CODEX_HOME（Windows 比较大小写不敏感、盘符根只作用于同盘）。
+- hpc / maintenance 实例、LaunchAgent/supervisor、runtime install 与迁移脚本
+  是 macOS 控制面功能，Windows bootstrap 不引入等价物；macOS 一侧不受影响。

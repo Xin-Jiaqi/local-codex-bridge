@@ -123,7 +123,12 @@ paths:
                   description: First user message
                 cwd:
                   type: string
-                  description: Working directory for the thread
+                  description: >-
+                    Absolute working directory for the thread on the machine hosting the
+                    bridge (macOS example /Users/<name>/some-project, Windows example
+                    D:\work-of-jiaqi\some-project). The bridge canonicalizes and rejects
+                    control-plane paths (HOME, bridge repo, instance state, CODEX_HOME)
+                    before starting the thread.
       responses:
         "200":
           description: Thread and turn started

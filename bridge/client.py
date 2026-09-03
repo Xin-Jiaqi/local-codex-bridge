@@ -12,6 +12,8 @@ import subprocess
 import threading
 import time
 
+from bridge.platform_paths import CodexSpawnResolutionError, codex_argv_head
+
 
 class AppServerError(Exception):
     """Base error for the app-server client."""
@@ -89,9 +91,17 @@ class CodexAppServerClient:
             raise AppServerError("client already started")
         env = dict(self.child_env if self.child_env is not None else os.environ)
         env["CODEX_HOME"] = self.codex_home
-        args = [self.codex_bin, "app-server", "--listen", "stdio://"]
+        # On Windows a codex.cmd npm shim cannot be spawned directly (cmd.exe
+        # re-tokenizes the command line and corrupts the quoted -c overrides);
+        # codex_argv_head resolves it to node + the real CLI entry (or a
+        # packaged native exe). macOS spawns [codex_bin, ...] unchanged.
+        extra = ["app-server", "--listen", "stdio://"]
         for kv in self.config_overrides:
-            args += ["-c", kv]
+            extra += ["-c", kv]
+        try:
+            args = codex_argv_head(self.codex_bin, extra)
+        except CodexSpawnResolutionError as e:
+            raise AppServerProcessError(str(e)) from e
         self.log.info("spawn: %s" % " ".join(args))
         self.log.info("CODEX_HOME: %s" % self.codex_home)
         try:

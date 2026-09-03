@@ -44,17 +44,41 @@ def _real(path):
     return os.path.realpath(os.path.abspath(path))
 
 
+def _fold(path):
+    """Case-fold a canonical path for comparisons. os.path.normcase is the
+    identity on POSIX (macOS behavior unchanged) and lowercases + normalizes
+    separators on Windows, where the filesystem is case-insensitive and a
+    control-plane path spelled differently must not bypass the guard."""
+    return os.path.normcase(path)
+
+
+def _same_drive(a, b):
+    """True when two paths live on the same Windows drive (or UNC root)."""
+    return os.path.splitdrive(a)[0].lower() == os.path.splitdrive(b)[0].lower()
+
+
 def _same_or_ancestor(cwd, target):
     """True when cwd equals target or is an ancestor of it."""
+    cwd = _fold(cwd)
+    target = _fold(target)
     if cwd == target:
         return True
-    if cwd == os.sep:
+    if os.name == "nt":
+        # A drive root (C:\) is an ancestor only of paths on the same drive;
+        # other drives behave like separate volumes (macOS analog: "/" is
+        # universal, "/Volumes/x" is an ordinary directory).
+        drive, tail = os.path.splitdrive(cwd)
+        if drive and tail in ("\\", "/"):
+            return _same_drive(cwd, target)
+    elif cwd == os.sep:
         return True  # "/" is an ancestor of every absolute path
     return target.startswith(cwd + os.sep)
 
 
 def _same_or_inside(cwd, target):
     """True when cwd equals target or is inside it."""
+    cwd = _fold(cwd)
+    target = _fold(target)
     return cwd == target or cwd.startswith(target + os.sep)
 
 

@@ -10,10 +10,13 @@ Design rules
 - Pure functions that take an explicit ``env`` dict; Windows paths are built
   with :mod:`ntpath`, which is deterministic on every host, so unit tests
   can run anywhere (including Linux CI / macOS).
-- Default Windows CODEX_HOME = ``%USERPROFILE%\\.codex``: the user copies
-  their existing DeepSeek provider config there (``config.toml`` +
-  ``providers/deepseek.toml``, no secrets required in the repo); the bridge
-  never reads or writes that directory's secret files.
+- Desktop vs Bridge isolation (dual-host-router): the Windows Desktop Codex
+  keeps ``%USERPROFILE%\\.codex`` (restored to OpenAI by the bootstrap;
+  auth.json/state/history are never read or touched), while the Bridge and
+  the ``codex-deepseek.cmd`` CLI wrapper use a DEDICATED DeepSeek CODEX_HOME
+  = ``%LOCALAPPDATA%\\local-codex-bridge\\codex-deepseek`` (the bootstrap
+  migrates any existing DeepSeek config out of the Desktop profile into this
+  directory). The bridge never reads ``auth.json``.
 - Default Windows state root = ``%LOCALAPPDATA%\\local-codex-bridge\\<instance>``,
   the Windows analog of ``${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge``.
   ``BRIDGE_STATE_ROOT`` / ``XDG_STATE_HOME`` overrides keep working (tests and
@@ -79,7 +82,9 @@ def windows_profile(env):
 
 
 def windows_defaults(env):
-    """Windows default paths: codex_home, state_root_base and work_root."""
+    """Windows default paths: codex_home (dedicated DeepSeek bridge profile),
+    desktop_codex_home (%USERPROFILE%\\.codex, OpenAI Desktop profile),
+    state_root_base and work_root."""
     profile = windows_profile(env)
     xdg = env.get("XDG_STATE_HOME")
     if xdg:
@@ -87,7 +92,10 @@ def windows_defaults(env):
     else:
         state_root_base = ntpath.join(profile["localappdata"], "local-codex-bridge")
     return {
-        "codex_home": ntpath.join(profile["userprofile"], ".codex"),
+        "codex_home": ntpath.join(
+            profile["localappdata"], "local-codex-bridge", "codex-deepseek"
+        ),
+        "desktop_codex_home": ntpath.join(profile["userprofile"], ".codex"),
         "state_root_base": state_root_base,
         "work_root": env.get("BRIDGE_WORK_ROOT") or DEFAULT_WINDOWS_WORK_ROOT,
     }

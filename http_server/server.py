@@ -5,6 +5,17 @@ One persistent Codex app-server client is spawned at startup
 model_provider=deepseek). All endpoints except GET /health require
 `Authorization: Bearer <BRIDGE_API_KEY>`.
 
+Dual-host router (BRIDGE_DUAL_HOST=true, opt-in): the same fixed public URL
+lets one GPT control the Mac bridge AND a second Windows machine. /start
+routes by workspace path (Windows drive/UNC/WSL paths -> Windows, macOS
+POSIX/no cwd -> the Mac); thread_id -> target mappings are persisted; the
+other /threads endpoints follow the mapping (probing both ends safely when
+the mapping is missing) and /threads merges both machines. The Windows
+machine never opens a public port: its outbound worker long-polls the
+internal API below (independent BRIDGE_WORKER_TOKEN, allowlisted kinds,
+bounded queue/response/timeouts). Without BRIDGE_DUAL_HOST every endpoint
+behaves exactly as before.
+
 The app-server is always spawned with `approval_policy="on-request"` plus a
 sandbox boundary selected by the BRIDGE_SANDBOX_MODE environment variable
 (see build_config_overrides):
@@ -35,6 +46,7 @@ accepts the Bridge repo itself or a real subdirectory as a task workspace.
 The bridge never forwards interactive approval requests to ChatGPT.
 """
 
+import datetime
 import hmac
 import json
 import os
@@ -44,6 +56,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bridge import AppServerError, BridgeCore, CodexAppServerClient, Logger
 from bridge.core import MODEL, MODEL_PROVIDER, REASONING_EFFORT
+from bridge.dual_host import (
+    DEFAULT_POLL_TIMEOUT_S,
+    OBSERVE_HEADROOM_S,
+    REMOTE_OP_WAIT_S,
+    TARGET_MAC,
+    TARGET_WINDOWS,
+    DualHostRouter,
+    RemoteError,
+    classify_cwd,
+)
 from bridge.workspace_guard import TaskCwdError
 
 DEFAULT_HOST = "127.0.0.1"
@@ -63,7 +85,22 @@ VALID_SANDBOX_MODES = (
 )
 DEFAULT_SANDBOX_MODE = SANDBOX_MODE_WORKSPACE_WRITE
 BRIDGE_PERMISSION_PROFILE = SANDBOX_MODE_BRIDGE_WORKSPACE
+DUAL_HOST_ENV = "BRIDGE_DUAL_HOST"
+WORKER_TOKEN_ENV = "BRIDGE_WORKER_TOKEN"
+THREAD_MAP_ENV = "BRIDGE_THREAD_MAP"
 _TRUTHY = ("1", "true", "yes", "on")
+
+
+def _sort_timestamp(value):
+    """Timestamp sort key for merged thread lists (None/invalid-safe)."""
+    if not isinstance(value, str):
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError:
+        return 0.0
 
 # bridge-workspace profile, injected entirely via `-c` dotted TOML overrides
 # so the mode needs no change to $CODEX_HOME/config.toml (apart from removing
@@ -283,8 +320,9 @@ def _windows_defaults(env):
 
 def default_codex_home(env=None):
     r"""CODEX_HOME default for the spawned app-server: macOS keeps the
-    dedicated bridge profile (~/.codex-deepseek); Windows uses the plain
-    %USERPROFILE%\.codex profile (DeepSeek provider config copied there)."""
+    dedicated bridge profile (~/.codex-deepseek); Windows uses its own
+    dedicated DeepSeek profile %LOCALAPPDATA%\local-codex-bridge\
+    codex-deepseek so the Desktop %USERPROFILE%\.codex stays OpenAI."""
     env = os.environ if env is None else env
     if os.name == "nt":
         return _windows_defaults(env)["codex_home"]
@@ -341,8 +379,8 @@ def build_cwd_guard(env=None):
     codex_home = env.get("CODEX_HOME")
     if not codex_home:
         if os.name == "nt":
-            # Windows bootstrap profile (local instance only): the user keeps
-            # the existing DeepSeek provider config in %USERPROFILE%\.codex.
+            # Windows: dedicated DeepSeek bridge profile (Desktop keeps
+            # %USERPROFILE%\.codex = OpenAI; see bridge/platform_paths.py).
             codex_home = _windows_defaults(env)["codex_home"]
         elif instance == "maintenance":
             codex_home = os.path.join(home, ".codex-deepseek-maintenance")
@@ -355,6 +393,48 @@ def build_cwd_guard(env=None):
         "state_root": state_root,
         "codex_home": codex_home,
     }
+
+
+def _default_thread_map_path(env=None, instance=None):
+    """thread_id -> host map file: instance state dir when an instance is
+    pinned, else the repo .runtime dir. Contains routing facts only (thread
+    ids + host), never prompts or secrets."""
+    env = os.environ if env is None else env
+    if instance in VALID_INSTANCES:
+        home = _platform_home(env)
+        base = env.get("BRIDGE_STATE_ROOT") or _state_root_base(env, home)
+        return os.path.join(base, instance, "thread_map.json")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, ".runtime", "thread_map.json")
+
+
+def _dual_host_router(logger, instance=None, env=None):
+    """Build the DualHostRouter when BRIDGE_DUAL_HOST=true, else None.
+
+    Dual-host mode is strictly opt-in so existing Mac-only deployments keep
+    byte-identical behavior (no probes, no merged lists, no new endpoints).
+    """
+    env = os.environ if env is None else env
+    if (env.get(DUAL_HOST_ENV) or "").strip().lower() not in _TRUTHY:
+        return None
+    worker_token = env.get(WORKER_TOKEN_ENV) or ""
+    map_path = env.get(THREAD_MAP_ENV) or _default_thread_map_path(env, instance)
+    try:
+        poll_s = float(env.get("BRIDGE_WORKER_POLL_TIMEOUT_S") or DEFAULT_POLL_TIMEOUT_S)
+    except (TypeError, ValueError):
+        poll_s = DEFAULT_POLL_TIMEOUT_S
+    router = DualHostRouter(
+        logger,
+        map_path=map_path,
+        enabled=True,
+        worker_token_present=bool(worker_token),
+        poll_timeout_s=poll_s,
+    )
+    logger.info(
+        "dual-host router enabled (worker token: %s, thread map: %s)"
+        % ("configured" if worker_token else "MISSING", map_path)
+    )
+    return router
 
 
 class HttpApiError(Exception):
@@ -373,6 +453,8 @@ class _BridgeHTTPServer(ThreadingHTTPServer):
         super().__init__(address, handler)
         self.core = None
         self.api_key = ""
+        self.worker_token = ""
+        self.router = None  # DualHostRouter when BRIDGE_DUAL_HOST=true
         self.log = None
 
 
@@ -430,6 +512,89 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         if not token or not hmac.compare_digest(token, expected):
             raise HttpApiError(401, "missing or invalid Bearer API key", "unauthorized")
 
+    def _require_worker_auth(self):
+        """Independent worker-token auth for the internal worker API.
+
+        The token is deliberately NOT the GPT-facing BRIDGE_API_KEY: the
+        internal API is only reachable by the Windows outbound worker.
+        """
+        router = getattr(self.server, "router", None)
+        if router is None or not router.enabled:
+            raise HttpApiError(404, "not found: %s" % self.path, "not_found")
+        expected = self.server.worker_token or ""
+        if not expected:
+            raise HttpApiError(
+                503,
+                "worker API is not enabled: set %s on the Mac bridge and "
+                "restart it" % WORKER_TOKEN_ENV,
+                "worker_api_disabled",
+            )
+        header = self.headers.get("Authorization") or ""
+        token = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+        if not token or not hmac.compare_digest(token, expected):
+            raise HttpApiError(401, "missing or invalid worker token", "unauthorized")
+
+    # ------------------------------------------- dual-host routing helpers
+
+    def _resolve_thread_target(self, thread_id):
+        """Return the owning host for a thread (mapping first, then probes).
+
+        Only non-mutating thread/read probes are used when the persisted
+        mapping is missing (router restart, pre-router threads, merged
+        /threads entries). Returns TARGET_MAC/TARGET_WINDOWS or None when no
+        host knows the thread (or Windows is offline and the Mac does not
+        know it - falling back to the historic 404 path).
+        """
+        router = getattr(self.server, "router", None)
+        if router is None or not router.enabled:
+            return TARGET_MAC
+        target = router.mapped(thread_id)
+        if target:
+            return target
+        if self._local_has_thread(thread_id):
+            router.record(thread_id, TARGET_MAC)
+            return TARGET_MAC
+        if router.configured():
+            try:
+                result = router.remote(
+                    "read", {"thread_id": thread_id},
+                    wait_s=REMOTE_OP_WAIT_S["probe"],
+                )
+            except RemoteError as e:
+                if e.status in (503, 504):
+                    return None  # Windows offline: behave like a plain 404
+                raise
+            if result.get("status") == 200:
+                router.record(thread_id, TARGET_WINDOWS)
+                return TARGET_WINDOWS
+        return None
+
+    def _local_has_thread(self, thread_id):
+        core = self.server.core
+        try:
+            core.read_thread(thread_id, include_turns=False)
+            return True
+        except AppServerError as e:
+            if "no thread" in str(e) or "not found" in str(e):
+                return False
+            raise
+
+    def _send_remote_result(self, result):
+        """Send a worker result through unchanged (body is the Windows local
+        bridge's own response/error payload, already HTTP-shaped)."""
+        body = result.get("body")
+        if isinstance(body, dict):
+            self._send_json(result.get("status", 502), body)
+        else:
+            self._error(
+                result.get("status", 502),
+                result.get("error") or "the Windows bridge did not return a response",
+                "windows_upstream_error",
+            )
+
+    def _remote_observe_wait(self, wait_ms):
+        return wait_ms / 1000.0 + OBSERVE_HEADROOM_S
+
     @staticmethod
     def _require_str(body, key, max_len=4000):
         value = body.get(key)
@@ -458,6 +623,10 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
             if path == "/health" or path == "/ready":
                 self._handle_health()
                 return
+            if path == "/internal/worker/status":
+                self._require_worker_auth()
+                self._handle_worker_status()
+                return
             if path == "/threads":
                 self._require_auth()
                 self._handle_list()
@@ -474,6 +643,8 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
             self._error(e.status, e.message, e.code)
         except TaskCwdError as e:
             self._error(400, e.reason, "invalid_cwd")
+        except RemoteError as e:
+            self._error(e.status, e.message, e.error_type)
         except AppServerError as e:
             self._error(502, "app-server error: %s" % e, "app_server_error")
         except Exception as e:
@@ -483,6 +654,14 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = urllib.parse.urlparse(self.path).path
+            if path == "/internal/worker/poll":
+                self._require_worker_auth()
+                self._handle_worker_poll(self._read_body())
+                return
+            if path == "/internal/worker/result":
+                self._require_worker_auth()
+                self._handle_worker_result(self._read_body())
+                return
             self._require_auth()
             if path == "/start":
                 self._handle_start(self._read_body())
@@ -500,6 +679,8 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
             self._error(e.status, e.message, e.code)
         except TaskCwdError as e:
             self._error(400, e.reason, "invalid_cwd")
+        except RemoteError as e:
+            self._error(e.status, e.message, e.error_type)
         except AppServerError as e:
             self._error(502, "app-server error: %s" % e, "app_server_error")
         except Exception as e:
@@ -533,6 +714,14 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
     def _handle_health(self):
         core = self.server.core
         r = self._readiness()
+        router = getattr(self.server, "router", None)
+        dual_host = None
+        if router is not None and router.enabled:
+            dual_host = {
+                "enabled": True,
+                "worker_configured": router.worker_token_present,
+                "worker_online": router.worker_token_present and router.broker.worker_alive(),
+            }
         payload = {
             "status": "ok" if r["ready"] else "unavailable",
             "ready": r["ready"],
@@ -545,15 +734,67 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
             "mode": self.server.mode or None,
             "port": self.server.port,
         }
+        if dual_host is not None:
+            payload["dual_host"] = dual_host
         self._send_json(200 if r["ready"] else 503, payload)
+
+    # ------------------------------------------- internal worker API
+
+    def _handle_worker_poll(self, body):
+        router = self.server.router
+        try:
+            timeout_s = int(body.get("timeout_s", DEFAULT_POLL_TIMEOUT_S))
+        except (TypeError, ValueError):
+            timeout_s = DEFAULT_POLL_TIMEOUT_S
+        job = router.broker.poll(timeout_s=timeout_s)
+        self.server.log.info(
+            "worker poll: jobs=%d" % (1 if job else 0)
+        )
+        self._send_json(200, {"jobs": [job] if job else []})
+
+    def _handle_worker_result(self, body):
+        job_id = body.get("job_id")
+        result = body.get("result")
+        router = self.server.router
+        if not isinstance(job_id, str) or not isinstance(result, dict):
+            raise HttpApiError(400, "job_id and result object are required", "bad_request")
+        accepted = router.broker.submit_result(job_id, result)
+        self.server.log.info(
+            "worker result: job=%s accepted=%s" % (job_id, accepted)
+        )
+        self._send_json(200, {"ok": accepted})
+
+    def _handle_worker_status(self):
+        router = self.server.router
+        status = router.broker.status()
+        status["enabled"] = True
+        status["worker_online"] = router.broker.worker_alive()
+        self._send_json(200, status)
 
     def _handle_start(self, body):
         prompt = self._require_str(body, "prompt")
         cwd = body.get("cwd")
         if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
             raise HttpApiError(400, "invalid field: cwd")
+        cwd = cwd.strip() if cwd else None
         core = self.server.core
-        thread_id, turn_id = core.start(prompt, cwd=cwd.strip() if cwd else None)
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled and classify_cwd(cwd) == TARGET_WINDOWS:
+            # Windows native path (C:\, D:\, UNC incl. \\wsl$\...): route the
+            # new thread to the Windows machine through its outbound worker.
+            self.server.log.info("http /start: cwd %s routed to Windows" % cwd)
+            result = router.remote(
+                "start", {"prompt": prompt, "cwd": cwd},
+                wait_s=REMOTE_OP_WAIT_S["start"],
+            )
+            body = result.get("body")
+            if result.get("status") == 200 and isinstance(body, dict) and body.get("thread_id"):
+                router.record(body["thread_id"], TARGET_WINDOWS)
+            self._send_remote_result(result)
+            return
+        thread_id, turn_id = core.start(prompt, cwd=cwd)
+        if router is not None and router.enabled:
+            router.record(thread_id, TARGET_MAC)
         self.server.log.info("http /start: thread=%s turn=%s" % (thread_id, turn_id))
         self._send_json(200, {"thread_id": thread_id, "turn_id": turn_id, "status": "started"})
 
@@ -568,6 +809,18 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 "invalid_cwd",
             )
         core = self.server.core
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled:
+            target = self._resolve_thread_target(thread_id)
+            if target == TARGET_WINDOWS:
+                result = router.remote(
+                    "continue", {"thread_id": thread_id, "prompt": prompt},
+                    wait_s=REMOTE_OP_WAIT_S["continue"],
+                )
+                self._send_remote_result(result)
+                return
+            if target is None:
+                raise HttpApiError(404, "unknown thread_id %s" % thread_id, "not_found")
         turn_id = core.continue_thread(thread_id, prompt)
         self.server.log.info("http /continue: thread=%s turn=%s" % (thread_id, turn_id))
         self._send_json(200, {"thread_id": thread_id, "turn_id": turn_id, "status": "started"})
@@ -577,6 +830,19 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         turn_id = self._require_str(body, "turn_id")
         wait_ms = self._require_int(body, "wait_ms", 5000, MAX_OBSERVE_WAIT_MS)
         core = self.server.core
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled:
+            target = self._resolve_thread_target(thread_id)
+            if target == TARGET_WINDOWS:
+                result = router.remote(
+                    "observe",
+                    {"thread_id": thread_id, "turn_id": turn_id, "wait_ms": wait_ms},
+                    wait_s=self._remote_observe_wait(wait_ms),
+                )
+                self._send_remote_result(result)
+                return
+            if target is None:
+                raise HttpApiError(404, "unknown thread_id %s" % thread_id, "not_found")
         if not core.tracker.is_registered(thread_id, turn_id):
             raise HttpApiError(404, "unknown turn_id %s on thread %s" % (turn_id, thread_id), "not_found")
         r = core.observe(thread_id, turn_id, wait_ms)
@@ -597,6 +863,19 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         turn_id = self._require_str(body, "turn_id")
         prompt = self._require_str(body, "prompt")
         core = self.server.core
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled:
+            target = self._resolve_thread_target(thread_id)
+            if target == TARGET_WINDOWS:
+                result = router.remote(
+                    "steer",
+                    {"thread_id": thread_id, "turn_id": turn_id, "prompt": prompt},
+                    wait_s=REMOTE_OP_WAIT_S["steer"],
+                )
+                self._send_remote_result(result)
+                return
+            if target is None:
+                raise HttpApiError(404, "unknown thread_id %s" % thread_id, "not_found")
         accepted = core.steer(thread_id, turn_id, prompt)
         self.server.log.info("http /steer: thread=%s turn=%s accepted" % (thread_id, accepted))
         self._send_json(200, {
@@ -614,6 +893,19 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         thread_id = self._require_str(body, "thread_id")
         turn_id = self._require_str(body, "turn_id")
         core = self.server.core
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled:
+            target = self._resolve_thread_target(thread_id)
+            if target == TARGET_WINDOWS:
+                result = router.remote(
+                    "interrupt",
+                    {"thread_id": thread_id, "turn_id": turn_id},
+                    wait_s=REMOTE_OP_WAIT_S["interrupt"],
+                )
+                self._send_remote_result(result)
+                return
+            if target is None:
+                raise HttpApiError(404, "unknown thread_id %s" % thread_id, "not_found")
         if not core.tracker.is_registered(thread_id, turn_id):
             raise HttpApiError(404, "unknown turn_id %s on thread %s" % (turn_id, thread_id), "not_found")
         r = core.interrupt(thread_id, turn_id)
@@ -636,13 +928,70 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         limit = max(1, min(limit, 20))  # clamp to [1, 20]; schema: default 10, min 1, max 20
         core = self.server.core
         tl = core.list_threads(limit=limit)
+        entries = list(tl.threads)
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled:
+            # Remember every thread we can see so later continue/read/...
+            # calls route without probing.
+            for entry in entries:
+                if entry.get("thread_id"):
+                    router.record(entry["thread_id"], TARGET_MAC)
+            if router.configured() and router.broker.worker_alive():
+                # Merge the Windows thread list with a bounded wait; an
+                # offline worker must never delay or break Mac listing.
+                try:
+                    result = router.remote(
+                        "list", {"limit": limit},
+                        wait_s=REMOTE_OP_WAIT_S["list"],
+                    )
+                except RemoteError as e:
+                    self.server.log.info(
+                        "http /threads: windows list skipped (%s)" % e.error_type
+                    )
+                else:
+                    if result.get("status") == 200 and isinstance(result.get("body"), dict):
+                        remote_entries = result["body"].get("threads") or []
+                        seen = {entry.get("thread_id") for entry in entries}
+                        for entry in remote_entries:
+                            if not isinstance(entry, dict):
+                                continue
+                            thread_id = entry.get("thread_id")
+                            if not thread_id:
+                                continue
+                            router.record(thread_id, TARGET_WINDOWS)
+                            if thread_id not in seen:
+                                entries.append(entry)
+                                seen.add(thread_id)
+                    else:
+                        self.server.log.info(
+                            "http /threads: windows list failed (status %s)"
+                            % result.get("status")
+                        )
+            entries.sort(
+                key=lambda t: _sort_timestamp(t.get("updated_at")),
+                reverse=True,
+            )
+            entries = entries[:limit]
         self.server.log.info(
-            "http /threads: returned %d thread(s) (limit=%d)" % (len(tl.threads), limit)
+            "http /threads: returned %d thread(s) (limit=%d)"
+            % (len(entries), limit)
         )
-        self._send_json(200, {"threads": tl.threads})
+        self._send_json(200, {"threads": entries})
 
     def _handle_read(self, thread_id):
         core = self.server.core
+        router = getattr(self.server, "router", None)
+        if router is not None and router.enabled:
+            target = self._resolve_thread_target(thread_id)
+            if target == TARGET_WINDOWS:
+                result = router.remote(
+                    "read", {"thread_id": thread_id},
+                    wait_s=REMOTE_OP_WAIT_S["read"],
+                )
+                self._send_remote_result(result)
+                return
+            if target is None:
+                raise HttpApiError(404, "unknown thread_id %s" % thread_id, "not_found")
         try:
             thread = core.read_thread(thread_id, include_turns=True)
         except AppServerError as e:
@@ -721,6 +1070,10 @@ class BridgeHttpServer:
         self.httpd.api_key = api_key
         self.httpd.log = self.log
         self.httpd._config_overrides = self._config_overrides
+        self.worker_token = os.environ.get(WORKER_TOKEN_ENV, "") or ""
+        self.httpd.worker_token = self.worker_token
+        self.router = _dual_host_router(self.log, instance=instance)
+        self.httpd.router = self.router
         self.port = self.httpd.server_address[1]
         self.httpd.instance = instance
         self.httpd.mode = mode

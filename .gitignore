@@ -1,5 +1,6 @@
 # secrets — never commit
 .bridge_api_key
+.bridge_worker_token
 .public_url
 .ngrok_domain
 .bridge_sandbox_mode

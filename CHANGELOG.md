@@ -3,11 +3,74 @@
 1.0.0 之前的条目根据本地源码与 2026-08-11 测试报告重建，日期为近似值；
 仓库自 2026-08-12 起纳入 git 管理（v1.0.0，分支 `main`）。
 
-## [Unreleased]
+## [Unreleased]（当前分支：dual-host-router，未发布）
 
-> 状态：分支 `windows-bootstrap` 上的 Windows 扩展，未发布、未 push 到
-> origin/main；第一版提交已 push 到 `origin/windows-bootstrap`。main /
-> v1.1.0 行为不变。HTTP API 无任何改动。
+> 状态：分支 `dual-host-router`（自 `windows-bootstrap` HEAD `bf6300f` 分出），
+> 未发布、未 push 到 origin/main；main / tag / `windows-bootstrap` 均不动。
+> 公开 HTTP API、openapi.yaml 与固定 Mac ngrok URL **零改动**；Mac 默认行为
+> 不变（dual-host 为显式 opt-in，`BRIDGE_DUAL_HOST=true` 才启用）。
+
+- **一 GPT 双机（dual-host-router 路由器，Mac 侧）**：保留当前 GPT Action 的固定
+  Mac ngrok URL 与现有 HTTP API/schema 不变。新增 `bridge/dual_host.py`：
+  `classify_cwd` 按 cwd 路由（`C:\`/`D:\`/UNC `\\server`、`\\wsl$\...`、
+  `\\wsl.localhost\...` → Windows；macOS POSIX / 无 cwd → Mac，默认不变）；
+  `ThreadTargetMap` 持久化 `thread_id → mac|windows`（原子写、只存路由事实，
+  无 prompt/secret）；`WorkerBroker` 有界队列（64 待办 / TTL 300s / 结果 ≤512KB /
+  poll ≤30s / 心跳判定离线）；`DualHostRouter` facade（带界远端等待 +
+  `RemoteError`）。`http_server/server.py` 在 `BRIDGE_DUAL_HOST=true` 时：
+  `/start` 按 cwd 路由并记录映射；`/continue /observe /steer /interrupt /read`
+  映射优先、缺失时安全探测两端（Windows 离线只在不必要路径才 404/503）；
+  `/threads` 合并两端（离线快速跳过）；新增内部 worker API
+  `POST /internal/worker/poll|result` + `GET /internal/worker/status`，独立
+  `BRIDGE_WORKER_TOKEN` 鉴权（≠ GPT 的 `.bridge_api_key`），token 缺失 503
+  `worker_api_disabled`、未启用 404；`/health` 仅在启用时附加 `dual_host` 字段。
+  启用方式：`scripts/start_ngrok_bridge.sh` 检测到 gitignored
+  `.bridge_worker_token`（local/legacy 实例）自动注入 `BRIDGE_DUAL_HOST=true` +
+  `BRIDGE_WORKER_TOKEN`（或手动 export 后重启；公开链路不变）。
+
+- **Windows 出站 worker（dual-host-router，Windows 侧）**：Windows 不开公网、
+  不抢 ngrok。新增 `bridge/worker.py`（`python -m bridge.worker`，纯 stdlib）：
+  长轮询 Mac 路由器内部 API，job kind allowlist（start/continue/observe/steer/
+  interrupt/read/list → 固定本地端点，转发 URL 不由路由器指定）、本地响应有界、
+  逐请求/连接超时 + 指数退避、token 类错误立即终止而非死循环、日志只含
+  job id/kind/状态码。`scripts/windows/start_local_codex_bridge.ps1` 默认模式
+  起本地 bridge 后自动拉起 worker 连 `-MacBridgeUrl`（默认 Mac 固定域名，
+  或 `MAC_BRIDGE_URL` env）；worker 离线不影响 Mac 请求；`-NoNgrok` 只起本地、
+  `-NgrokCutover` 保留旧单机 cutover 回退、`-Stop` 只停本脚本进程。
+
+- **Desktop OpenAI / Bridge DeepSeek 隔离（Windows，dual-host-router）**：不依赖
+  app-server `--profile`。Desktop 继续用 `%USERPROFILE%\.codex`（OpenAI）：
+  ps1 的 `Invoke-HomeSeparationPhase` 把 DeepSeek 配置（config.toml +
+  providers/，不动 auth.json/state/history）迁移到专用 CODEX_HOME
+  `%LOCALAPPDATA%\local-codex-bridge\codex-deepseek`，并从官方备份
+  `%USERPROFILE%\.codex\backup-deepseek\config.toml` 还原 Desktop OpenAI 配置
+  （无备份则安全生成最小 `gpt-5.6-sol` OpenAI 配置）；Bridge app-server 恒用
+  专用 DeepSeek profile（`bridge/platform_paths.py` Windows 默认 codex_home 已
+  改为专用目录，新增 `desktop_codex_home` 键）。新增
+  `scripts/windows/codex-deepseek.cmd` wrapper（临时设 CODEX_HOME 后调用真实
+  codex；普通 Desktop/codex 保持 OpenAI）。DeepSeek key 不明文落盘：首次掩码
+  输入后用 Windows DPAPI（CryptProtectData）加密存
+  `%LOCALAPPDATA%\local-codex-bridge\secrets\deepseek.key.dpapi`，启动时只在
+  子进程环境注入、不打印；worker token 同 DPAPI 存储。不读取 auth.json；
+  `Invoke-OpenaiBaseUrlGuard` 只在确认用户级 `OPENAI_BASE_URL` 指向 DeepSeek
+  时才清除（普通代理/base-url 保持）。
+
+- **测试 / CI / 文档（dual-host-router）**：新增 `tests/test_dual_host.py`（26 项：
+  分类/映射持久化/队列有界性/超时/worker 转发桩/auth/日志无 prompt）与
+  `tests/test_dual_host_http.py`（12 项：真实 HTTP handler + worker 循环，线程内
+  fake Mac/Win bridge，无网络——/start cwd 路由、映射路由、worker auth/offline/
+  timeout、/threads 合并）；`tests/test_windows_support.py` 增至 51 项（46 项
+  任意平台 + 5 项 Windows-only：DPAPI/隔离迁移/worker 模式/wrapper/占位符/secret
+  面）。CI 离线集合与 py_compile 加入上述文件；README「Windows：一 GPT 双机」与
+  `docs/dual-host-router.md` 用人话说明两种模式与隔离；本 CHANGELOG 归档
+  windows-bootstrap 历史。
+
+### windows-bootstrap（已并入 dual-host-router 分支的提交记录）
+
+> 以下分组是 `dual-host-router` 的父分支 `windows-bootstrap` 上已 push 到
+> origin/windows-bootstrap 的提交记录（HEAD `bf6300f` 被本分支继承）。
+> 其中早期"CODEX_HOME = %USERPROFILE%\\.codex / cutover"描述已被上方
+> dual-host-router 的隔离 + 出站 worker 取代，保留仅为历史归档。
 
 - **Windows 原生 bootstrap（windows-bootstrap）**：PowerShell + Windows Python
   + Windows Codex CLI，不改协议；默认工作根 `D:\work-of-jiaqi`、CODEX_HOME

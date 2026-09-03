@@ -30,7 +30,9 @@ jobs:
             tests/test_activate_runtime_autorecovery.py \
             tests/test_bootstrap_autorecovery_command.py \
             tests/test_host_ops_lock.py \
-            tests/test_windows_support.py; do
+            tests/test_windows_support.py \
+            tests/test_dual_host.py \
+            tests/test_dual_host_http.py; do
             python3 "$t"
           done
       - name: py_compile
@@ -39,6 +41,7 @@ jobs:
           python3 -m py_compile \
             http_server/server.py \
             bridge/__init__.py bridge/client.py bridge/core.py bridge/platform_paths.py \
+            bridge/dual_host.py bridge/worker.py \
             scripts/migrate_codex_home_permissions.py \
             tests/test_*.py
       - name: Shell syntax (bash -n)

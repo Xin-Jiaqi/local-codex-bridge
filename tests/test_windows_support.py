@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Offline tests for the Windows bootstrap support (windows-bootstrap).
+"""Offline tests for the Windows bootstrap support (dual-host-router).
 
 Covers, without any live bridge / app-server / network / secret:
 
 PART 1 (runs on every host): bridge/platform_paths.py pure resolution -
-Windows profile/defaults (CODEX_HOME=%USERPROFILE%\\.codex, state root
+Windows profile/defaults (Desktop %USERPROFILE%\\.codex stays OpenAI; the
+bridge CODEX_HOME is the dedicated DeepSeek profile
+%LOCALAPPDATA%\\local-codex-bridge\\codex-deepseek, state root
 %LOCALAPPDATA%\\local-codex-bridge, work root D:\\work-of-jiaqi), codex
 detection order (CODEX_BIN > %APPDATA%\\npm\\codex.cmd > codex.exe on PATH
 > codex.cmd on PATH), npm codex.cmd shim resolution to node + the real JS
@@ -17,10 +19,16 @@ rejections, drive-root semantics, and acceptance of the default Windows work
 root D:\\work-of-jiaqi.
 
 PART 3 (runs on every host): structural checks of
-scripts/windows/start_local_codex_bridge.ps1 - preparation mode (-NoNgrok),
-fixed-domain default, local /health + /ready gates before the ngrok phase,
-that secrets (API key / ngrok authtoken) are never echoed or written, and
-that no path is ever built at load time from still-empty layout placeholders
+scripts/windows/start_local_codex_bridge.ps1 - the dual-host default (local
+bridge + OUTBOUND worker; Windows opens no public port and never starts ngrok
+unless the deprecated -NgrokCutover flag is passed), Desktop OpenAI / Bridge
+DeepSeek separation (backup-deepseek restore or minimal OpenAI config,
+dedicated %LOCALAPPDATA%\\local-codex-bridge\\codex-deepseek, DPAPI secret
+store, OPENAI_BASE_URL scrub only when confirmed DeepSeek, codex-deepseek.cmd
+wrapper), the fixed-domain default, local /health + /ready gates before any
+outbound phase, that secrets (API key / DeepSeek key / worker token / ngrok
+authtoken) are never echoed or written in plain text, and that no path is
+ever built at load time from still-empty layout placeholders
 (Windows PowerShell aborts such runs with a 'parameter "Path" is an empty
 string' binding error) - all env-driven path variables are guarded instead.
 External commands resolve to plain string paths (Get-CommandPath:
@@ -69,14 +77,17 @@ NATIVE_EXE = r"C:\Users\Jiaqi\.local\bin\codex.exe"
 # Layout vars that are plain "" at script load time and only derive their
 # real value inside Initialize-Layout (never Join-Path'd while still empty).
 LAYOUT_PLACEHOLDER_VARS = (
-    "StateRootBase", "InstanceDir", "RuntimeDir", "BridgePidFile",
-    "NgrokPidFile", "BridgeLog", "BridgeOutLog", "BridgeErrLog",
-    "NgrokLog", "NgrokOutLog", "NgrokErrLog", "InstanceJson",
+    "StateRootBase", "InstanceDir", "RuntimeDir", "DeepseekCodexHome",
+    "SecretsDir", "DeepseekSecretFile", "WorkerTokenFile", "BridgePidFile",
+    "NgrokPidFile", "WorkerPidFile", "BridgeLog", "BridgeOutLog",
+    "BridgeErrLog", "NgrokLog", "NgrokOutLog", "NgrokErrLog", "WorkerLog",
+    "WorkerOutLog", "WorkerErrLog", "WorkerStateFile", "InstanceJson",
 )
 INSTANCE_RUNTIME_FILE_VARS = (
     "BridgePidFile", "NgrokPidFile", "BridgeLog", "BridgeOutLog",
     "BridgeErrLog", "NgrokLog", "NgrokOutLog", "NgrokErrLog",
-    "InstanceJson",
+    "WorkerPidFile", "WorkerLog", "WorkerOutLog", "WorkerErrLog",
+    "WorkerStateFile", "InstanceJson",
 )
 
 
@@ -116,7 +127,15 @@ class WindowsDefaultsTest(unittest.TestCase):
 
     def test_windows_defaults_codex_home_and_state_root(self):
         defaults = windows_defaults(WIN_ENV)
-        self.assertEqual(defaults["codex_home"], r"C:\Users\Jiaqi\.codex")
+        # Bridge DeepSeek CODEX_HOME is dedicated; Desktop keeps OpenAI in
+        # %USERPROFILE%\.codex (Desktop is never touched by the bridge).
+        self.assertEqual(
+            defaults["codex_home"],
+            r"C:\Users\Jiaqi\AppData\Local\local-codex-bridge\codex-deepseek",
+        )
+        self.assertEqual(
+            defaults["desktop_codex_home"], r"C:\Users\Jiaqi\.codex"
+        )
         self.assertEqual(
             defaults["state_root_base"],
             r"C:\Users\Jiaqi\AppData\Local\local-codex-bridge",
@@ -361,7 +380,7 @@ class WindowsCwdGuardTest(unittest.TestCase):
         canonical = validate_task_cwd(cwd, home=r"C:\Users\bridge-user",
                                       repo_root=r"C:\Users\bridge-user\repo",
                                       state_root=r"C:\Users\bridge-user\repo-state",
-                                      codex_home=r"C:\Users\bridge-user\.codex")
+                                      codex_home=r"C:\Users\bridge-user\AppData\Local\local-codex-bridge\codex-deepseek")
         self.assertTrue(canonical.lower().startswith(r"d:\work-of-jiaqi"))
 
     def test_build_cwd_guard_windows_defaults(self):
@@ -373,7 +392,10 @@ class WindowsCwdGuardTest(unittest.TestCase):
         }
         guard = build_cwd_guard(env)
         self.assertEqual(guard["home"], r"C:\Users\Jiaqi")
-        self.assertEqual(guard["codex_home"], r"C:\Users\Jiaqi\.codex")
+        self.assertEqual(
+            guard["codex_home"],
+            r"C:\Users\Jiaqi\AppData\Local\local-codex-bridge\codex-deepseek",
+        )
         self.assertEqual(
             guard["state_root"],
             r"C:\Users\Jiaqi\AppData\Local\local-codex-bridge\local",
@@ -395,6 +417,9 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
         self.assertGreater(len(self.source), 3000)
         self.assertIn("[switch]$NoNgrok", self.source)
         self.assertIn("[switch]$Stop", self.source)
+        self.assertIn("[switch]$NgrokCutover", self.source)
+        self.assertIn("[string]$MacBridgeUrl", self.source)
+        self.assertIn("[string]$WorkerToken", self.source)
         self.assertIn("-NoNgrok", self.source)
         self.assertIn("-ExecutionPolicy Bypass", self.source)
 
@@ -403,12 +428,20 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
             '$script:FixedDomainDefault = "diploma-ideology-skier.ngrok-free.dev"',
             self.source,
         )
+        self.assertIn(
+            '$script:MacBridgeUrlDefault = "https://diploma-ideology-skier.ngrok-free.dev"',
+            self.source,
+        )
         self.assertIn("$env:NGROK_DOMAIN", self.source)
         self.assertIn("[string]$Domain", self.source)
 
     def test_windows_defaults_present(self):
         self.assertIn('$WorkRoot = "D:\\work-of-jiaqi"', self.source)
-        self.assertIn('(Require-EnvPath "USERPROFILE") ".codex"', self.source)
+        # Dedicated DeepSeek bridge profile (Desktop %USERPROFILE%\.codex
+        # stays OpenAI; the bridge never uses it as CODEX_HOME).
+        self.assertIn('$script:DeepseekCodexHome = Join-Path $script:StateRootBase "codex-deepseek"', self.source)
+        self.assertIn("backup-deepseek\\config.toml", self.source)
+        self.assertIn('model = "gpt-5.6-sol"', self.source)
         self.assertIn('Join-Path $appData.Trim() "npm\\codex.cmd"', self.source)
 
     def test_local_health_and_ready_verified_before_ngrok_phase(self):
@@ -437,7 +470,9 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
             r"^\s*(Write-Host|Write-Info|Write-Fail|Write-Output|Write-Error|"
             r"Out-File|Set-Content|Add-Content|ConvertTo-Json).*", re.I
         )
-        value_echo = re.compile(r"(?<!`)\$env:(BRIDGE_API_KEY|NGROK_AUTHTOKEN|DEEPSEEK_API_KEY)")
+        value_echo = re.compile(
+            r"(?<!`)\$env:(BRIDGE_API_KEY|NGROK_AUTHTOKEN|DEEPSEEK_API_KEY|BRIDGE_WORKER_TOKEN)"
+        )
         forbidden = []
         for lineno, line in enumerate(self.lines, 1):
             if not echoing.match(line):
@@ -466,14 +501,23 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
         self.assertIn("$python = Get-PythonCommand", python_section)
         self.assertIn("return $python", python_section)
 
-    def test_deepseek_key_user_env_and_masked_prompt(self):
-        # Key comes from session env, then the Windows USER env var; when a
-        # Codex config exists and only the key is missing, prompt once with a
-        # masked input; auth.json is never read.
-        self.assertIn('GetEnvironmentVariable("DEEPSEEK_API_KEY", "User")', self.source)
+    def test_deepseek_key_dpapi_store_and_masked_prompt(self):
+        # The DeepSeek key is never stored in plain text: session env first,
+        # then the DPAPI-protected store (deepseek.key.dpapi), then a legacy
+        # plaintext USER env var is migrated into DPAPI (never auto-deleted
+        # but never relied on), and only interactive terminals get a masked
+        # prompt that writes DPAPI. auth.json is never read.
+        self.assertIn("deepseek.key.dpapi", self.source)
+        self.assertIn('[System.Security.Cryptography.DataProtectionScope]::CurrentUser', self.source)
+        self.assertIn("[System.Security.Cryptography.ProtectedData]::Protect", self.source)
+        self.assertIn("[System.Security.Cryptography.ProtectedData]::Unprotect", self.source)
+        self.assertIn("WriteAllBytes($Path, $protected)", self.source)
         self.assertIn('Read-Host "DeepSeek API key" -AsSecureString', self.source)
         self.assertIn("[Console]::IsInputRedirected", self.source)
         self.assertIn("SecureStringToBSTR", self.source)
+        # the key is only ever injected into the child process env
+        self.assertIn("function Ensure-DeepseekKey", self.source)
+        self.assertNotIn("setx DEEPSEEK_API_KEY <", self.source)
         for lineno, line in enumerate(self.lines, 1):
             if "auth.json" not in line:
                 continue
@@ -542,6 +586,7 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
             "BRIDGE_API_KEY", "BRIDGE_INSTANCE", "BRIDGE_STATE_ROOT",
             "BRIDGE_PORT", "BRIDGE_SANDBOX_MODE", "BRIDGE_APPROVAL_POLICY",
             "BRIDGE_NETWORK_ACCESS", "CODEX_HOME", "CODEX_BIN", "PYTHONUTF8",
+            "DEEPSEEK_API_KEY", "BRIDGE_WORKER_TOKEN", "MAC_BRIDGE_URL",
         ])
 
     # --------------------- empty-path regression (PS 5.1 Path binding) ----
@@ -614,16 +659,117 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
     def test_codex_home_placeholder_and_default_resolution_guarded(self):
         # -CodexHome is optional: the load-time "" placeholder prevents
         # Set-StrictMode from aborting Invoke-BridgePhase on the unset
-        # $script:CodexHome, and the %USERPROFILE%\.codex default resolution
-        # (the DeepSeek config location) is guarded with a diagnosable error.
+        # $script:CodexHome, and the dedicated DeepSeek profile
+        # (%LOCALAPPDATA%\local-codex-bridge\codex-deepseek) is the default;
+        # Desktop %USERPROFILE%\.codex is never used as bridge CODEX_HOME.
         load_region = self.source[:self.source.index("function Write-Info")]
         for var in ("CodexHome", "CodexBin", "WorkRoot"):
             self.assertIn('$script:%s = ""' % var, load_region)
         bridge_phase = self.source[self.source.index("function Invoke-BridgePhase"):
                                    self.source.index("function Resolve-TunnelDomain")]
-        self.assertIn('(Require-EnvPath "USERPROFILE") ".codex"', bridge_phase)
+        self.assertIn("$script:CodexHome = $script:DeepseekCodexHome", bridge_phase)
         self.assertIn('GetEnvironmentVariable("CODEX_HOME", "Process")', bridge_phase)
         self.assertIn('throw "CODEX_HOME is empty', bridge_phase)
+
+    def test_dual_host_worker_phase_structural(self):
+        # Default mode = local bridge + outbound worker; Windows never opens
+        # a public port and never starts ngrok unless -NgrokCutover is passed.
+        self.assertIn("function Invoke-WorkerPhase", self.source)
+        self.assertIn("function Ensure-Worker", self.source)
+        self.assertIn("function Ensure-WorkerToken", self.source)
+        self.assertIn("function Wait-WorkerConnected", self.source)
+        self.assertIn("python -m bridge.worker", self.source)
+        self.assertIn("--router-url", self.source)
+        self.assertIn("--local-api-key-file", self.source)
+        self.assertIn("--state-file", self.source)
+        self.assertIn("worker.state.json", self.source)
+        main_region = self.source[self.source.index("# ------------------------------------------------------------------- main"):]
+        worker_call = main_region.index("Invoke-WorkerPhase")
+        ngrok_call = main_region.index("Invoke-NgrokPhase")
+        cutover = main_region.index("$NgrokCutover")
+        self.assertLess(cutover, ngrok_call)
+        self.assertLess(cutover, worker_call)
+        # local /health and /ready gates run before any outbound phase
+        self.assertLess(
+            self.source.index("function Wait-LocalHealth"),
+            self.source.index("function Invoke-WorkerPhase"),
+        )
+        # the worker only ever talks to the local bridge + the Mac router
+        self.assertNotIn("ngrok http ", self.source.split("function Invoke-WorkerPhase")[1])
+
+    def test_desktop_openai_bridge_deepseek_separation_structural(self):
+        # Desktop restore: backup-deepseek config preferred, minimal OpenAI
+        # config as the no-backup fallback; never touches auth.json/state.
+        self.assertIn("function Invoke-HomeSeparationPhase", self.source)
+        self.assertIn("function Test-ConfigMarkedDeepseek", self.source)
+        self.assertIn("function Write-MinimalOpenAiDesktopConfig", self.source)
+        self.assertIn("function Write-DeepseekBridgeConfig", self.source)
+        self.assertIn("backup-deepseek\\config.toml", self.source)
+        self.assertIn('model = "gpt-5.6-sol"', self.source)
+        self.assertIn('model_provider = "openai"', self.source)
+        self.assertIn("api.deepseek.com", self.source)
+        # bridge config with an env_key reference only (no key value)
+        self.assertIn('env_key = "DEEPSEEK_API_KEY"', self.source)
+        # auth.json is never read or written (full-file scan also below)
+        for lineno, line in enumerate(self.lines, 1):
+            if "auth.json" not in line.lower():
+                continue
+            low = line.lower()
+            for op in ("readalltext", "get-content", "copy-item",
+                       "out-file", "set-content", "add-content",
+                       "invoke-restmethod", "invoke-webrequest"):
+                if op in low:
+                    self.fail("auth.json %s attempt at line %d: %s"
+                              % (op, lineno, line.strip()))
+
+    def test_openai_base_url_scrub_is_deepseek_confirmed_only(self):
+        guard = self.source[self.source.index("function Invoke-OpenaiBaseUrlGuard"):
+                            self.source.index("function Install-DeepseekCliWrapper")]
+        self.assertIn('GetEnvironmentVariable("OPENAI_BASE_URL", "User")', guard)
+        self.assertIn('$userValue -match "(?i)deepseek"', guard)
+        self.assertIn(
+            '[Environment]::SetEnvironmentVariable("OPENAI_BASE_URL", $null, "User")',
+            guard,
+        )
+        # a non-DeepSeek OPENAI_BASE_URL (normal proxy) is kept untouched
+        self.assertIn("kept untouched", guard)
+        self.assertNotIn('SetEnvironmentVariable("OPENAI_BASE_URL", $null',
+                         guard.split('$userValue -match')[0])
+
+    def test_codex_deepseek_wrapper_exists_and_is_installed(self):
+        wrapper = os.path.join(ROOT, "scripts", "windows", "codex-deepseek.cmd")
+        with open(wrapper, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("CODEX_HOME=%LOCALAPPDATA%\\local-codex-bridge\\codex-deepseek", text)
+        self.assertIn("setlocal", text.lower())
+        self.assertIn("codex %*", text)
+        # the wrapper only ever sets the dedicated DeepSeek CODEX_HOME; the
+        # Desktop %USERPROFILE%\.codex appears in comments only, never as a
+        # set/read target
+        self.assertNotIn('set "CODEX_HOME=%USERPROFILE%', text)
+        self.assertIn("%LOCALAPPDATA%\\local-codex-bridge\\codex-deepseek", text)
+        # and the bootstrap installs it next to the detected codex binary
+        self.assertIn("function Install-DeepseekCliWrapper", self.source)
+        self.assertIn('$destDir = Split-Path -Parent $cmd', self.source)
+        self.assertIn('Copy-Item -LiteralPath $wrapperSrc -Destination $dest -Force', self.source)
+
+    def test_secrets_store_is_dpapi_never_plaintext(self):
+        # deepseek.key.dpapi and worker.token.dpapi are only written through
+        # Protect-BridgeSecretText (CryptProtectData); no plaintext writer may
+        # target the secrets dir, and no Get-Content/ReadAllText may be used
+        # to print them.
+        self.assertIn("deepseek.key.dpapi", self.source)
+        self.assertIn("worker.token.dpapi", self.source)
+        self.assertIn("function Protect-BridgeSecretText", self.source)
+        self.assertIn("function Unprotect-BridgeSecretText", self.source)
+        for lineno, line in enumerate(self.lines, 1):
+            if ".dpapi" not in line:
+                continue
+            low = line.lower()
+            for op in ("get-content", "out-file", "set-content", "add-content"):
+                if op in low:
+                    self.fail("plaintext secret writer on dpapi file at line %d: %s"
+                              % (lineno, line.strip()))
 
     def test_work_root_whitespace_falls_back_to_default(self):
         main_region = self.source[self.source.index("# ------------------------------------------------------------------- main"):]

@@ -18,6 +18,13 @@
 #   ./scripts/set_bridge_sandbox_mode.sh to persist a mode.
 #   BRIDGE_NETWORK_ACCESS=true               (enable network in workspace-write mode)
 #
+# Dual-host router (opt-in, one GPT controls Mac + Windows): drop a worker
+# token into $ROOT/.bridge_worker_token (gitignored) and this script enables
+# BRIDGE_DUAL_HOST + BRIDGE_WORKER_TOKEN for the bridge. The public URL and
+# every public HTTP endpoint stay byte-identical; Windows attaches through
+# its outbound worker instead of opening a public port (see
+# bridge/dual_host.py + scripts/windows/start_local_codex_bridge.ps1).
+#
 # Pinned instance (local | hpc | maintenance), see scripts/bridge_instance_lib.sh:
 #   Selected ONLY by BRIDGE_INSTANCE at process startup (default local); no
 #   task-facing switch exists. Instance state lives OUTSIDE this repo under
@@ -192,6 +199,25 @@ derive_instance_env() {
   derive_runtime_paths
   BRIDGE_SANDBOX_MODE="$SANDBOX_MODE"
   export BRIDGE_SANDBOX_MODE BRIDGE_NETWORK_ACCESS BRIDGE_APPROVAL_POLICY CODEX_HOME
+}
+
+# Dual-host router opt-in: .bridge_worker_token (gitignored) enables the
+# internal worker API so the Windows outbound worker can attach. local /
+# legacy only - hpc and maintenance instances stay isolated.
+enable_dual_host_if_configured() {
+  if [[ -n "$INSTANCE" && "$INSTANCE" != "local" ]]; then
+    return
+  fi
+  if [[ ! -f "$ROOT/.bridge_worker_token" ]]; then
+    return
+  fi
+  if [[ -z "${BRIDGE_DUAL_HOST:-}" ]]; then
+    export BRIDGE_DUAL_HOST=true
+  fi
+  if [[ -z "${BRIDGE_WORKER_TOKEN:-}" ]]; then
+    export BRIDGE_WORKER_TOKEN="$(tr -d '[:space:]' < "$ROOT/.bridge_worker_token")"
+  fi
+  log "dual-host: worker API enabled (.bridge_worker_token); the public URL/API are unchanged"
 }
 
 # Resolve the public ngrok domain: NGROK_DOMAIN env > instance
@@ -420,6 +446,7 @@ check_public_health() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   resolve_instance
   resolve_public_url
+  enable_dual_host_if_configured
   check_prereqs
   validate_sandbox_env
   acquire_start_lock

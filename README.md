@@ -41,6 +41,9 @@ Local Workspace (sandbox_mode=workspace-write, approval_policy=on-request)
 - 全链路只有一个持久 `codex app-server` 进程，Bridge 与它是一对一连接；
 - `thread_id` / `turn_id` 就是会话句柄，ChatGPT 不需要理解 Codex 内部格式；
 - 模型后端、API key、工作区全部在你的机器上，公网只暴露一个带 key 的 HTTP 面。
+- dual-host-router 分支（可选）让**同一个 GPT 同时控制 Mac + Windows**：Mac 保留
+  固定公网 URL 做路由器，Windows 只做出站 worker、不开公网（见「Windows：一
+  GPT 双机」）；默认不开启时一切行为不变。
 
 **控制面 vs 任务面（1.1.0）**：控制面（实例配置、运行状态、LaunchAgent）与任务面
 （ChatGPT 驱动的任务工作区）显式分离。控制面状态存放在任务工作区之外
@@ -102,90 +105,111 @@ export BRIDGE_API_KEY="$(cat .bridge_api_key)"
 python3 -m http_server --host 127.0.0.1 --port 8321
 ```
 
-## Windows 快速开始（windows-bootstrap）
+## Windows：一 GPT 双机（dual-host-router）
 
-`windows-bootstrap` 分支给同一套 bridge 增加 **Windows 原生支持**（PowerShell +
-Windows Python + Windows Codex CLI），**不改任何 HTTP API**：GPT Action 用到的
-`/health /ready /start /continue /observe /steer /interrupt /threads` 与 macOS
-完全一致，也不引入任何新协议 / MCP tunnel。macOS 一侧的脚本、实例布局与行为
-保持不变，Mac 与 Windows 可以各自跑自己的本地 bridge（都监听
-`127.0.0.1:8321`，互不影响）；共享同一个 Custom GPT Action URL 时，因为
-**同一个固定 ngrok 域名同一时刻只能由一台机器占用**，需要按下面的 cutover
-顺序"切换域名归属"，而不是同时开着两边的 ngrok。
+一句话：**同一个 Custom GPT（同一个 Action URL、同一把 API key）可以同时控制
+Mac 和 Windows 两台机器**。Mac 上固定 ngrok URL 与全部公开 HTTP API 保持
+不变；Windows **不开公网、不抢 ngrok 域名**，只装一个"出站 worker"，主动去
+连 Mac 的路由器领活、在本机执行、把结果交回去。换机器 = 换 `/start` 里的
+`cwd` 路径，仅此而已。
 
-Windows 默认值（`start_local_codex_bridge.ps1` 可覆盖，env 优先）：
+### 路由规则（GPT 视角，用人话）
 
-- 工作根目录 `D:\work-of-jiaqi`（不存在时脚本自动创建；`/start` 的 `cwd`
-  也可以显式传其它绝对项目目录，cwd 守卫规则不变）；
-- `CODEX_HOME = %USERPROFILE%\.codex`：把现有 DeepSeek provider 配置
-  （`config.toml` + `providers/` 等）从 Mac 拷贝过去即可复用，脚本只做
-  "配置是否存在" 的提示，**不读取** `auth.json` / API key；
-- codex 可执行文件自动探测：`CODEX_BIN` > `%APPDATA%\npm\codex.cmd`（npm）
-  > PATH 上的原生 `codex.exe` / `codex.cmd`；检测不到时自动安装：先 npm
-  用户前缀全局安装 `@openai/codex`，失败再走官方原生 Windows 安装器
-  （均免管理员，装后自动刷新 PATH 并继续），两条路都失败才打印最短命令；
-- 实例控制面状态在仓库外：`%LOCALAPPDATA%\local-codex-bridge\local\`
-  （只含非 secret 字段的 `instance.json`、PID/日志），对应 macOS 的
-  `${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge/<instance>/`。
-  Windows bootstrap 面向 `local` 实例；hpc/maintenance 控制面仍是 macOS 功能。
+- `/start` 给 Windows 原生路径（`C:\...`、`D:\...`、UNC `\\server\share`，
+  含 WSL 挂载 `\\wsl$\<发行版>` / `\\wsl.localhost\<发行版>`，正斜杠形式
+  `//server/share` 同样识别）→ 新任务在 **Windows** 上跑；
+- `/start` 给 macOS POSIX 路径（`/Users/...`）或不给 `cwd` → 和以前一样在
+  **Mac** 上跑（不破坏现有 GPT Action 的默认行为）；
+- `thread_id → 哪台机器` 的映射会持久化：之后的 `continue / observe /
+  steer / interrupt / read` 自动按映射路由到正确那台；映射缺失（如路由器
+  重启过）时会安全地探测两端再决定；`/threads` 把两台机器的线程列表合并
+  返回（Windows 离线时自动跳过，绝不影响 Mac 侧的正常请求）。
 
-前置条件（除 secret 外全部由脚本自动处理）：
+### 怎么开启（两步，都不动公开 URL）
 
-- **Python 3.8+**：缺失时脚本自动安装——先 `winget install --scope user
-  Python.Python.3.12`（不请求管理员），winget 不可用/不支持 user scope 时改用
-  官方 python.org per-user 静默安装（`InstallAllUsers=0`，无 UAC），装完自动
-  刷新 PATH 并继续；两条路都失败才打印最短手工命令；
-- **Codex CLI**：缺失时脚本依次尝试 npm 全局安装（用户前缀）与官方原生
-  Windows 安装器（均免管理员），成功即继续；都失败才打印命令；
-- **`DEEPSEEK_API_KEY`**：脚本按 会话环境变量 → Windows 用户环境变量 顺序
-  读取（绝不打印值）；若只有 Codex config 而 key 缺失，交互式终端会弹一次
-  掩码输入（仅本会话），否则打印两行最短提示（不读取 `auth.json`）；也可
-  预先 `setx DEEPSEEK_API_KEY <key>` 后开新 Terminal 免输入；
-- **ngrok**（仅 cutover 需要）：缺失时脚本自动下载官方 Windows zip 到
-  `%LOCALAPPDATA%\ngrok`（无需管理员）；authtoken 来自 `NGROK_AUTHTOKEN`
-  环境变量或已有 `ngrok config`（`ngrok config check` 通过即可），脚本不读取、
-  不打印 token；
-- API key 文件 `.bridge_api_key`：缺失时自动生成 256-bit key（gitignored）；
-  若 GPT Action 已用 Mac 的 key，把 Mac 的 `.bridge_api_key` 内容复制过来，
-  两台机器共用同一把 key。
-
-命令（在仓库根目录的 PowerShell 里执行）：
+1. **Mac（一次性，选不断链的窗口做）**：在仓库根放一个 gitignored 的
+   `.bridge_worker_token`（内容随便一段长随机串），然后重启一次 bridge：
+   `./scripts/stop_ngrok_bridge.sh && ./scripts/start_ngrok_bridge.sh`。
+   启动脚本检测到该文件会自动开启 `BRIDGE_DUAL_HOST=true` + 注入
+   `BRIDGE_WORKER_TOKEN`（等价于手动 export 这两个变量后重启）。公网 URL 与
+   每个公开端点保持字节级不变；不配置时 dual-host 完全关闭，Mac 行为与以前
+   一模一样。本 README 只说明做法，**不会替你执行这次重启**。
+2. **Windows（第一次运行，全自动）**：在仓库根目录的 PowerShell 里执行
+   （脚本会自动装 Python/Codex、还原 Desktop OpenAI 配置、DPAPI 存
+   DeepSeek key，详见下节）：
 
 ```powershell
-# 1) 准备阶段（-NoNgrok / 准备模式）：只起本地 bridge 并验证
-powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 -NoNgrok
-
-#    验证本地 /health 与 /ready（脚本自己也会在起 ngrok 前强制验证）
-curl.exe http://127.0.0.1:8321/health
-curl.exe http://127.0.0.1:8321/ready
-
-# 2) cutover：先在 Mac 上停掉旧 bridge（外部操作，任选其一）
-#    ./scripts/stop_ngrok_bridge.sh          # 只停脚本启动的进程
-#    ./scripts/uninstall_launch_agent.sh --instance local --stop   # 停自启托管
-
-# 3) Windows 接管固定域名（默认 diploma-ideology-skier.ngrok-free.dev；
-#    可 -Domain <其它域名> 或 NGROK_DOMAIN env 覆盖）：脚本先复用/拉起本地
-#    bridge 并验证 /health + /ready，再启动 ngrok，最后验证公网 /health
 powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1
-
-# 4) 停止（只停本脚本启动的进程）
-powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 -Stop
 ```
 
-要点：
+默认行为：本地 bridge 监听 `127.0.0.1:8321` 并验证 `/health` + `/ready`；
+随后自动启动出站 worker `python -m bridge.worker`，长轮询 Mac 路由器
+（默认 `https://diploma-ideology-skier.ngrok-free.dev`，可用
+`-MacBridgeUrl` 或 `MAC_BRIDGE_URL` 覆盖），把 `start/continue/observe/
+steer/interrupt/read/list` 任务转发到本机 8321 并回传结果。**不装 ngrok、
+不占用任何公网域名**；worker token 首次以掩码输入（或 `-WorkerToken` 传参），
+DPAPI 加密保存。Mac 路由器还没开 dual-host 时，worker 会带退避后台重试，
+本地 bridge 照常可用——Windows 离线或路由器抖动都不会反过来拖慢 Mac。
+停止：同一命令加 `-Stop`（只停本脚本启动的进程）。
 
-- **共存 vs 切换**：两套 bridge 可共存（各自机器本地 8321）；但共享同一
-  Action URL 时，固定域名只能由一台机器的 ngrok 占用——Mac 的 ngrok 还开着时，
-  Windows 的 ngrok 会失败，脚本会打印日志尾部并提示先停 Mac（不会碰 Mac）。
-  反过来 Mac 再接管前也要先停 Windows。切换期间 Action URL 本身不变（域名
-  相同），两端 bearer key 相同即可无缝；GPT 侧只需把任务 `cwd` 从
-  `/Users/...` 换成本机绝对路径（Windows 默认 `D:\work-of-jiaqi\...`）。
-- **不做的事**：不引入 OpenAI Secure MCP Tunnel（与当前 Actions HTTP 链路
-  无关）；不做 macOS 的 LaunchAgent/supervisor 等价物（Windows 手动运行或由
-  用户自配任务计划程序）；`ngrok`/key/authtoken 相关 secret 绝不落日志或
-  PID/instance 文件。
+本地纯调试 / 只起 bridge 不起 worker：加 `-NoNgrok`（该参数与旧版含义一致，
+只是如今默认模式已经与 ngrok 无关，改名 `-LocalOnly` 更贴切，为兼容保留）。
 
-## Mac → Windows cutover helper（windows-bootstrap）
+### Desktop OpenAI / Bridge DeepSeek 隔离（Windows，用人话）
+
+目标：**桌面上的 Codex 永远是 OpenAI，只有 Bridge 用 DeepSeek**，两者互不
+污染，且不依赖任何 `--profile` 机制：
+
+- **Desktop（OpenAI）**：普通 Codex 桌面应用 / 普通 `codex` 命令继续用
+  `%USERPROFILE%\.codex`。若你之前为了跑 DeepSeek 改过这个目录，脚本会自动
+  从官方备份 `%USERPROFILE%\.codex\backup-deepseek\config.toml` 还原 OpenAI
+  配置；没有备份就写一个最小 OpenAI 配置（`gpt-5.6-sol`）。`state/`、
+  `history/`、`auth.json` **从不读取、从不改动**。只有当确认用户级
+  `OPENAI_BASE_URL` 指向 DeepSeek 时才清除它（普通代理/自建 base URL 保持
+  原样，避免误删）。
+- **Bridge（DeepSeek）**：app-server 永远使用独立 CODEX_HOME
+  `%LOCALAPPDATA%\local-codex-bridge\codex-deepseek`；已有 DeepSeek 配置
+  （`config.toml` + `providers/` 等）会自动迁移过去，缺失则自动生成
+  DeepSeek provider 配置（`env_key` 引用，不内嵌 key）。
+- **`codex-deepseek.cmd`**：临时设置上述专用 CODEX_HOME 后调用真实 `codex`
+  的 wrapper（安装到 codex 同目录；仓库内也保留一份
+  `scripts\windows\codex-deepseek.cmd`）。想从命令行走 DeepSeek 就用它，
+  普通 `codex` 仍是 OpenAI。
+- **DeepSeek key 不明文落盘**：首次掩码输入后，用 Windows DPAPI（当前用户）
+  加密存 `%LOCALAPPDATA%\local-codex-bridge\secrets\deepseek.key.dpapi`；
+  启动时只在子进程环境变量中注入，不打印、不入日志。worker token 同样
+  DPAPI 保存。
+
+### 旧 cutover 模式（legacy 可选）
+
+早先 windows-bootstrap 的"Windows 独占固定 ngrok 域名、Mac 先停"模式仍可用
+（加 `-NgrokCutover` 参数，可再叠 `-NoNgrok` 只做本地准备），但日常已被上面
+的 dual-host 模式取代；两种模式二选一，不要同时开。其余默认值不变：工作根
+`D:\work-of-jiaqi`（不存在自动创建）、codex 自动探测/安装（npm 用户前缀 →
+官方 Windows 安装器，均免管理员）、实例状态
+`%LOCALAPPDATA%\local-codex-bridge\local\`（对应 macOS
+`${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge/<instance>/`，
+Windows 面向 `local` 实例）。
+
+### 安全与不变量
+
+- 内部 worker API（`/internal/worker/poll|result|status`）使用**独立的**
+  `BRIDGE_WORKER_TOKEN`（≠ GPT 用的 `.bridge_api_key`），端点 allowlist、
+  队列/响应/超时全部有界，日志只含 job id/kind/状态码——prompt、key、token
+  一律不入日志；worker 本地的转发目标由 kind 静态决定，路由器给什么 URL
+  都改不了它。
+- Mac 侧未配置 token 时内部 API 返回 404/503，公开 API 行为零变化；
+  `/health` 仅在 dual-host 开启时附加 `dual_host` 状态字段。
+- 除 secret 外前置条件全部自动：Python 3.8+ 缺失时 winget
+  `--scope user` → python.org per-user 静默安装；Codex 缺失时自动安装；
+  ngrok 只在 legacy cutover 模式需要（自动下载官方 zip 到
+  `%LOCALAPPDATA%\ngrok`）。
+
+## Mac → Windows cutover helper（windows-bootstrap，legacy 可选）
+
+> **已被 dual-host 取代**：默认模式（见上节）里 Windows 不再需要 ngrok，
+> 因此也不再需要搬运 ngrok authtoken。只有当你明确要回退到"单机独占固定
+> 域名"的旧 cutover 时才需要本节内容。
 
 把 Mac 的 bridge 凭据一次性搬到 Windows 的最小助手（小范围新增，不改 macOS
 脚本）。只有两个迁移物，全部在 Mac 内存中打包加密、绝不打印到
@@ -231,9 +255,9 @@ python3 scripts/prepare_macos_cutover.py
 ```
 
 然后按原 cutover 顺序：Windows 端运行
-`powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1`
-（域名与 Mac 不同时加 `-Domain <域名>`）→ 成功后 Mac 端停 ngrok。若 Windows
-仓库不在 `D:\work-of-jiaqi\actions-bridge`，重新生成时用
+`powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1
+-NgrokCutover`（域名与 Mac 不同时加 `-Domain <域名>`）→ 成功后 Mac 端停
+ngrok。若 Windows 仓库不在 `D:\work-of-jiaqi\actions-bridge`，重新生成时用
 `--windows-key-path` 覆盖目标路径。测试：
 `python3 -m pytest tests/test_prepare_macos_cutover.py -q`。
 
@@ -499,9 +523,10 @@ LaunchAgent 方式（登录自启即用 `bridge-workspace`）：
 - `assistant_text` 摘要截断（4000 字符）；`/threads` 单页 ≤20。
 - 会记录 `Model metadata for deepseek-chat not found` warning（仅记录，不致命）。
 - 运行时日志包含 thread 内容与命令文本，全部 gitignored，不要在日志里放秘密。
-- 仅在 macOS arm64 + `codex 0.147.0` 实测；`windows-bootstrap` 分支新增的 Windows
-  支持（PowerShell bootstrap + 平台路径解析）只经过离线单测与平台条件测试，尚未在
-  真实 Windows 主机实机验证；Linux 与其它 codex 版本未验证。
+- 仅在 macOS arm64 + `codex 0.147.0` 实测；`windows-bootstrap` / `dual-host-router`
+  分支新增的 Windows 支持（PowerShell bootstrap + 平台路径解析 + dual-host 路由器
+  与出站 worker）只经过离线单测与平台条件测试，尚未在真实 Windows 主机实机
+  验证；Linux 与其它 codex 版本未验证。
 - 暂无 MCP layer；`bridge/` 的接口设计预留了未来在其上构建 MCP 的可能。
 
 ## 项目结构
@@ -511,10 +536,18 @@ bridge/                核心库
   client.py            CodexAppServerClient：spawn/shutdown app-server、JSON-RPC 收发、
                        通知分发、进程退出处理
   core.py              BridgeCore：start/continue/observe/steer/interrupt/list/read
+  dual_host.py         dual-host 路由器核心：cwd 分类（Windows 盘符/UNC/WSL vs
+                       macOS POSIX）、thread_id→host 持久映射、有界 worker 队列/
+                       结果/心跳、远端操作带界等待（零依赖，任意平台可测）
+  worker.py            Windows 出站 worker（python -m bridge.worker）：长轮询 Mac
+                       路由器内部 API，allowlist 转发到本机 127.0.0.1:8321 并回传
   workspace_guard.py   任务 cwd 守卫：拒绝 HOME/Bridge 仓库/状态根/CODEX_HOME 作为任务工作区
                          （Windows 下按大小写不敏感 + 盘符根语义比较，macOS 行为不变）
-  platform_paths.py    Windows 平台默认路径与 codex 探测（%APPDATA%\npm\codex.cmd /
-                       原生 codex.exe）、npm shim → node+entry 解析（纯函数，macOS 不使用）
+  platform_paths.py    Windows 平台默认路径与 codex 探测：Desktop 保留
+                       %USERPROFILE%\.codex（OpenAI），Bridge/CLI wrapper 用专用
+                       %LOCALAPPDATA%\local-codex-bridge\codex-deepseek（DeepSeek）；
+                       %APPDATA%\npm\codex.cmd / 原生 codex.exe、npm shim → node+entry
+                       （纯函数，macOS 不使用）
 http_server/           HTTP API（stdlib ThreadingHTTPServer，Bearer 认证）
   server.py            路由、参数校验、错误格式、openapi 校验点
 scripts/
@@ -546,28 +579,37 @@ scripts/
   bridge_mode_lib.sh            模式解析共享库（env > 文件 > 默认）
   pid_guard_lib.sh            PID 身份只读校验（stop 只杀本项目管理的进程）
   windows/
-    start_local_codex_bridge.ps1  Windows bootstrap：依赖检查/安装、默认工作根与 CODEX_HOME、
-                             起 bridge 127.0.0.1:8321、验证本地 /health + /ready 后可选起 ngrok
-                             固定域名 cutover（-NoNgrok 准备模式 / -Stop；secret 不入日志）
+    start_local_codex_bridge.ps1  Windows bootstrap（默认 dual-host）：Desktop OpenAI /
+                             Bridge DeepSeek 隔离与迁移、DPAPI secret 存储、起本地
+                             bridge 127.0.0.1:8321 并验证 /health + /ready、自动起
+                             出站 worker 连 Mac 路由器；-NoNgrok 只起本地、-NgrokCutover
+                             回退旧单机 cutover、-Stop 只停本脚本进程（secret 不入日志）
+    codex-deepseek.cmd    CLI wrapper：临时设 CODEX_HOME=专用 DeepSeek profile 后调用
+                             真实 codex（普通 codex / Desktop 保持 OpenAI）
 config/
   bridge-workspace.example.toml  bridge-workspace profile 参考模板（与 server.py 的 -c 注入规则一致，测试保证同步）
 tests/
   test_instance_isolation.py  离线单测：实例隔离/策略/无切换/admin-only 写入/fallback/迁移/碰撞/运行时路径（41 项）
   test_workspace_guard.py     离线单测：cwd 守卫（HOME/仓库/状态根/CODEX_HOME/symlink）（19 项）
   test_maintenance_instance.py 离线单测：maintenance 模板/策略/域隔离/碰撞/cwd 守卫 scope/health 元数据/
-                             activate-deactivate 脚本不变量 + supervisor 交接/回滚（40 项）
+                             activate-deactivate 脚本不变量 + supervisor 交接/回滚（52 项）
   test_runtime_supervisor.py 离线单测：runtime install/uninstall allowlist/原子 current/.runtime-build-info 无 secret/
                              --dest/根目录 700/marker 守卫、plist PathState、supervisor enable-disable/crash 补起/
-                             pause-resume/TERM/哨兵、legacy 精确迁移、runtime-copy 运行、maintenance 协同（35 项：24 离线 + 11 live 需 ps）
+                             pause-resume/TERM/哨兵、legacy 精确迁移、runtime-copy 运行、maintenance 协同（43 项）
   test_config_propagation.py  离线单测：spawn 参数包含 approval/sandbox override
   test_git_automation.py      离线单测：沙箱模式纯 profile 约束（不混用 legacy 键）、child env 代理清理、legacy 键检测、profile 模板授权范围；可选集成验证
   test_migrate_codex_home_permissions.py 离线单测：迁移脚本 dry-run/verify/apply、幂等、备份 600、不打印 secret
   test_bridge_core.py         集成测试：start/continue/observe/interrupt/进程退出（5 场景）
   test_bridge_actions.py      集成测试：7 个 action（含 steer 排队语义）
   test_http_api.py            集成测试：HTTP API + openapi 校验（12 个场景）
-  test_windows_support.py     离线单测：Windows 默认路径/codex 探测/npm shim 解析/argv 兼容
-                             （36 项：31 项任意平台可跑 + 5 项 Windows-only 平台条件测试）
-                             + PowerShell bootstrap 结构/secret 面静态检查
+  test_dual_host.py           离线单测：dual-host 核心（cwd 分类/映射持久化/worker 队列
+                             有界性/超时/auth/日志无 prompt）
+  test_dual_host_http.py      离线单测：真实 HTTP handler + worker 循环（线程内 fake
+                             Mac/Win app-server，无网络）：/start 按 cwd 路由、映射
+                             路由、worker auth/offline/timeout、/threads 合并
+  test_windows_support.py     离线单测：Windows 默认路径/codex 探测/npm shim/argv 兼容
+                             （51 项：46 项任意平台 + 5 项 Windows-only）+ PowerShell
+                             bootstrap 结构/DPAPI/worker 模式/secret 面静态检查
 .github/workflows/ci.yml   GitHub Actions：离线安全测试 + py_compile + bash -n + plist lint（无 secret/网络）
 openapi.yaml            公共 Actions 模板（servers URL 为占位符）
 schemas/                codex app-server 协议 JSON Schema（v1/v2，参考用）
@@ -638,8 +680,9 @@ bootstrap 实机验证**（runtime 安装、LaunchAgent 装载、supervisor 实�
   BSD-3-Clause；tag `v1.0.0` 指向 `fa82e91`，**不移动**）。v1.0.0 发布版只有
   `workspace-write`（V1 边界）一个沙箱模式，没有实例 / cwd 守卫 / 多实例
   LaunchAgent。
-- 离线单测（当前可复现，无需 app-server，共 **290 项** = 原有 254 项 + 新增
-  36 项 windows 支持；macOS 本地：原有 4 项跳过 + 新增 5 项 Windows-only 跳过）：
+- 离线单测（当前可复现，无需 app-server，共 **343 项** = windows-bootstrap 分支
+  290 项 + 本次新增 53 项：dual-host 26 项 + dual-host-http 12 项 + windows_support
+  由 36 增至 51 项；macOS 本地跳过 9 项）：
   `tests/test_config_propagation.py`（3）、`tests/test_sandbox_mode.py`（7）、
   `tests/test_instance_isolation.py`（41）、`tests/test_workspace_guard.py`（19）、
   `tests/test_maintenance_instance.py`（52）、`tests/test_runtime_supervisor.py`（43）、
@@ -649,10 +692,13 @@ bootstrap 实机验证**（runtime 安装、LaunchAgent 装载、supervisor 实�
   `tests/test_activate_runtime_autorecovery.py`（11）、
   `tests/test_bootstrap_autorecovery_command.py`（11）、
   `tests/test_host_ops_lock.py`（11，single-writer host-ops lock）、
-  `tests/test_windows_support.py`（36：31 项任意平台 + 5 项 Windows-only 平台条件测试）。
-  跳过 9 项：pid guard 3 项 live-process（无 `ps` 的沙箱内跳过）+ git
-  automation 1 项可选 sandbox 集成（需普通 Terminal + `RUN_SANDBOX_TESTS=1`）
-  + windows_support 5 项 Windows-only（`os.name == "nt"` 才执行）。
-  CI 跑同一集合（集成验证除外）。
+  `tests/test_windows_support.py`（51：46 项任意平台 + 5 项 Windows-only 平台条件测试）、
+  `tests/test_dual_host.py`（26：cwd 分类/映射持久化/队列有界/超时/worker 转发桩/
+  auth/日志无 prompt）、`tests/test_dual_host_http.py`（12：真实 HTTP handler +
+  worker 循环，线程内 fake Mac/Win bridge，无网络：/start cwd 路由、映射路由、
+  worker auth/offline/timeout、/threads 合并）。
+  跳过 9 项：pid guard 3 项 live-process（无 `ps` 的沙箱内跳过）+ git automation
+  1 项可选 sandbox 集成（需普通 Terminal + `RUN_SANDBOX_TESTS=1`）+ windows_support
+  5 项 Windows-only（`os.name == "nt"` 才执行）。CI 跑同一集合（集成验证除外）。
 - 集成测试需要真实 app-server + DeepSeek key，无 CI 自动化、未在发布后复跑：`python3 tests/test_bridge_core.py`、`python3 tests/test_bridge_actions.py`、`python3 tests/test_http_api.py`。最近一次完整实测（2026-08-11）为全 PASS：core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6（历史记录）。当前 `test_http_api.py` 含 12 个唯一场景（含 openapi 校验，部署副本缺失/占位按通过处理），与历史记录的差异未复跑确认。
 - 已实测能力：start/continue/observe/steer/interrupt/list/read、本地读写、shell、native thread 连续工作、Bearer API Key、workspace-write + approval_policy=on-request、Bridge/ngrok 后台启动、PID 管理、stop 隔离、health checks、完整 stop→start→health 生命周期；runtime install/uninstall、supervisor enable/disable、crash 补起、pause-resume 与 maintenance 交接在 temp-dir 离线测试验证；2026-08-14 真实 host round-trip 已实机验证 runtime 安装、LaunchAgent 装载、supervisor 实机运行与真实 bridge crash-recovery（见 `docs/release-validation-v1.1.0.md` 第 3 节）。

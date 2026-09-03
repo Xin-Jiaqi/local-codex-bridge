@@ -19,7 +19,10 @@ root D:\\work-of-jiaqi.
 PART 3 (runs on every host): structural checks of
 scripts/windows/start_local_codex_bridge.ps1 - preparation mode (-NoNgrok),
 fixed-domain default, local /health + /ready gates before the ngrok phase,
-and that secrets (API key / ngrok authtoken) are never echoed or written.
+that secrets (API key / ngrok authtoken) are never echoed or written, and
+that no path is ever built at load time from still-empty layout placeholders
+(Windows PowerShell aborts such runs with a 'parameter "Path" is an empty
+string' binding error) - all env-driven path variables are guarded instead.
 """
 
 import json
@@ -56,6 +59,19 @@ NPM_PKG = r"C:\Users\Jiaqi\AppData\Roaming\npm\node_modules\@openai\codex\packag
 NPM_ENTRY = r"C:\Users\Jiaqi\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js"
 NODE = r"C:\Program Files\nodejs\node.exe"
 NATIVE_EXE = r"C:\Users\Jiaqi\.local\bin\codex.exe"
+
+# Layout vars that are plain "" at script load time and only derive their
+# real value inside Initialize-Layout (never Join-Path'd while still empty).
+LAYOUT_PLACEHOLDER_VARS = (
+    "StateRootBase", "InstanceDir", "RuntimeDir", "BridgePidFile",
+    "NgrokPidFile", "BridgeLog", "BridgeOutLog", "BridgeErrLog",
+    "NgrokLog", "NgrokOutLog", "NgrokErrLog", "InstanceJson",
+)
+INSTANCE_RUNTIME_FILE_VARS = (
+    "BridgePidFile", "NgrokPidFile", "BridgeLog", "BridgeOutLog",
+    "BridgeErrLog", "NgrokLog", "NgrokOutLog", "NgrokErrLog",
+    "InstanceJson",
+)
 
 
 def fake_which(name, path=None):
@@ -386,8 +402,8 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
 
     def test_windows_defaults_present(self):
         self.assertIn('$WorkRoot = "D:\\work-of-jiaqi"', self.source)
-        self.assertIn('Join-Path $env:USERPROFILE ".codex"', self.source)
-        self.assertIn('$env:APPDATA "npm\\codex.cmd"', self.source)
+        self.assertIn('(Require-EnvPath "USERPROFILE") ".codex"', self.source)
+        self.assertIn('Join-Path $appData.Trim() "npm\\codex.cmd"', self.source)
 
     def test_local_health_and_ready_verified_before_ngrok_phase(self):
         wait_health = self.source.index("function Wait-LocalHealth")
@@ -521,6 +537,96 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
             "BRIDGE_PORT", "BRIDGE_SANDBOX_MODE", "BRIDGE_APPROVAL_POLICY",
             "BRIDGE_NETWORK_ACCESS", "CODEX_HOME", "CODEX_BIN", "PYTHONUTF8",
         ])
+
+    # --------------------- empty-path regression (PS 5.1 Path binding) ----
+    def test_load_time_placeholders_are_empty_and_never_join_path(self):
+        # Reported Windows PS 5.1 failure: pid/log/instance paths were
+        # Join-Path'd at load time from InstanceDir/RuntimeDir which are still
+        # "" there, aborting EVERY run (any flag, even -Stop) before main with
+        # 'Cannot bind argument to parameter "Path" because it is an empty
+        # string'. Load time may only Join-Path bases that are already
+        # guaranteed non-empty: $PSScriptRoot (after its guard) and
+        # $script:RepoRoot (after Resolve-Path).
+        load_region = self.source[:self.source.index("function Write-Info")]
+        for var in LAYOUT_PLACEHOLDER_VARS:
+            self.assertIn('$script:%s = ""' % var, load_region,
+                          "%s must start as a plain empty placeholder at load time" % var)
+        guarded_bases = ("$PSScriptRoot", "$script:RepoRoot")
+        for lineno, line in enumerate(load_region.splitlines(), 1):
+            if "Join-Path" not in line or line.lstrip().startswith("#"):
+                continue
+            if not any(base in line for base in guarded_bases):
+                self.fail("load-time Join-Path at line %d uses an unguarded "
+                          "base: %s" % (lineno, line.strip()))
+
+    def test_runtime_files_derived_after_dirs_inside_initialize_layout(self):
+        # All pid/log/instance file paths must be derived inside
+        # Initialize-Layout, strictly after InstanceDir/RuntimeDir exist, so
+        # Join-Path never receives an empty base on Windows PS 5.1.
+        layout = self.source[self.source.index("function Initialize-Layout"):
+                             self.source.index("function Test-PortBusy")]
+        self.assertIn('(Require-EnvPath "LOCALAPPDATA")', layout)
+        instance_join = layout.index("$script:InstanceDir = Join-Path")
+        runtime_join = layout.index("$script:RuntimeDir = Join-Path")
+        self.assertLess(instance_join, runtime_join)
+        for var in INSTANCE_RUNTIME_FILE_VARS:
+            marker = "$script:%s = Join-Path" % var
+            self.assertIn(marker, layout,
+                          "%s must be derived inside Initialize-Layout" % var)
+            self.assertGreater(layout.index(marker), runtime_join,
+                               "%s must be derived after RuntimeDir exists" % var)
+
+    def test_script_root_and_repo_root_guards_are_diagnosable(self):
+        # An empty $PSScriptRoot (pasted / -Command execution) or an
+        # unresolvable repo root must produce a clear error, not PowerShell's
+        # cryptic 'parameter "Path" is an empty string' binding failure.
+        load_region = self.source[:self.source.index("function Write-Info")]
+        self.assertIn("IsNullOrWhiteSpace($PSScriptRoot)", load_region)
+        self.assertIn("throw \"this script must be run from a file", load_region)
+        self.assertIn('Join-Path -Path $PSScriptRoot -ChildPath "..\\.."', load_region)
+        self.assertIn("-ErrorAction Stop", load_region)
+        self.assertIn("throw \"cannot resolve the bridge repo root", load_region)
+        self.assertIn(
+            '$script:KeyFile = Join-Path $script:RepoRoot ".bridge_api_key"',
+            load_region,
+        )
+
+    def test_env_paths_never_reach_join_path_unguarded(self):
+        # No path env var may feed Join-Path directly: required vars go
+        # through Require-EnvPath (diagnosable throw with the variable name),
+        # optional probes read a validated local variable first. A direct
+        # 'Join-Path $env:X' would pass an empty string straight to the Path
+        # parameter on Windows PowerShell 5.1.
+        self.assertNotIn("Join-Path $env:", self.source)
+        for name in ("LOCALAPPDATA", "TEMP", "USERPROFILE"):
+            self.assertIn('Require-EnvPath "%s"' % name, self.source,
+                          "required path env var %s must go through Require-EnvPath" % name)
+        for name in ("APPDATA", "LOCALAPPDATA", "USERPROFILE",
+                     "BRIDGE_STATE_ROOT", "XDG_STATE_HOME", "CODEX_HOME"):
+            self.assertIn('GetEnvironmentVariable("%s", "Process")' % name, self.source)
+
+    def test_codex_home_placeholder_and_default_resolution_guarded(self):
+        # -CodexHome is optional: the load-time "" placeholder prevents
+        # Set-StrictMode from aborting Invoke-BridgePhase on the unset
+        # $script:CodexHome, and the %USERPROFILE%\.codex default resolution
+        # (the DeepSeek config location) is guarded with a diagnosable error.
+        load_region = self.source[:self.source.index("function Write-Info")]
+        for var in ("CodexHome", "CodexBin", "WorkRoot"):
+            self.assertIn('$script:%s = ""' % var, load_region)
+        bridge_phase = self.source[self.source.index("function Invoke-BridgePhase"):
+                                   self.source.index("function Resolve-TunnelDomain")]
+        self.assertIn('(Require-EnvPath "USERPROFILE") ".codex"', bridge_phase)
+        self.assertIn('GetEnvironmentVariable("CODEX_HOME", "Process")', bridge_phase)
+        self.assertIn('throw "CODEX_HOME is empty', bridge_phase)
+
+    def test_work_root_whitespace_falls_back_to_default(self):
+        main_region = self.source[self.source.index("# ------------------------------------------------------------------- main"):]
+        default = '$WorkRoot = "D:\\work-of-jiaqi"'
+        self.assertIn(default, main_region)
+        self.assertLess(main_region.index("IsNullOrWhiteSpace($WorkRoot)"),
+                        main_region.index(default))
+        self.assertIn("IsNullOrWhiteSpace($env:BRIDGE_WORK_ROOT)", main_region)
+        self.assertIn("$script:WorkRoot = $WorkRoot.Trim()", main_region)
 
 
 if __name__ == "__main__":

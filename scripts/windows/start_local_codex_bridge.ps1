@@ -87,29 +87,52 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------------ layout
-$script:Version = "windows-bootstrap-1.0.1"
+$script:Version = "windows-bootstrap-1.0.2"
 $script:FixedDomainDefault = "diploma-ideology-skier.ngrok-free.dev"
-$script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $script:Instance = "local"
 $script:HostAddr = "127.0.0.1"
 $script:Port = 8321
 $script:BaseUrl = "http://$($script:HostAddr):$($script:Port)"
+
+# RepoRoot is needed by every mode (bridge working dir + .bridge_api_key).
+# Resolve it from $PSScriptRoot right away, but only after guarding against an
+# empty script root: when the script is pasted/run via -Command, $PSScriptRoot
+# is empty and Join-Path/Resolve-Path would fail with a cryptic 'parameter
+# "Path" is an empty string' binding error instead of a diagnosable message.
+if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    throw "this script must be run from a file (powershell.exe -NoProfile -ExecutionPolicy Bypass -File <repo>\scripts\windows\start_local_codex_bridge.ps1): the script root is empty"
+}
+try {
+    $script:RepoRoot = (Resolve-Path -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath "..\..") -ErrorAction Stop).Path
+} catch {
+    throw "cannot resolve the bridge repo root from '$PSScriptRoot' (expected scripts\windows\start_local_codex_bridge.ps1 inside the repo): $($_.Exception.Message)"
+}
+if ([string]::IsNullOrWhiteSpace($script:RepoRoot)) {
+    throw "the bridge repo root resolved to an empty path from '$PSScriptRoot'"
+}
 $script:KeyFile = Join-Path $script:RepoRoot ".bridge_api_key"
 
 # Instance layout is derived in Initialize-Layout (after the environment
-# sanity check at the top of main), so missing env vars fail cleanly.
+# sanity check at the top of main). The placeholders below are intentionally
+# plain "" and are never Join-Path'd at load time: InstanceDir/RuntimeDir are
+# still empty here and Windows PowerShell would abort EVERY run (any flag,
+# even -Stop) before main starts with 'Cannot bind argument to parameter
+# "Path" because it is an empty string'.
 $script:StateRootBase = ""
 $script:InstanceDir = ""
 $script:RuntimeDir = ""
-$script:BridgePidFile = Join-Path $script:RuntimeDir "bridge.pid"
-$script:NgrokPidFile = Join-Path $script:RuntimeDir "ngrok.pid"
-$script:BridgeLog = Join-Path $script:RuntimeDir "bridge.log"
-$script:BridgeOutLog = Join-Path $script:RuntimeDir "bridge.out.log"
-$script:BridgeErrLog = Join-Path $script:RuntimeDir "bridge.err.log"
-$script:NgrokLog = Join-Path $script:RuntimeDir "ngrok.log"
-$script:NgrokOutLog = Join-Path $script:RuntimeDir "ngrok.out.log"
-$script:NgrokErrLog = Join-Path $script:RuntimeDir "ngrok.err.log"
-$script:InstanceJson = Join-Path $script:InstanceDir "instance.json"
+$script:BridgePidFile = ""
+$script:NgrokPidFile = ""
+$script:BridgeLog = ""
+$script:BridgeOutLog = ""
+$script:BridgeErrLog = ""
+$script:NgrokLog = ""
+$script:NgrokOutLog = ""
+$script:NgrokErrLog = ""
+$script:InstanceJson = ""
+$script:CodexHome = ""
+$script:CodexBin = ""
+$script:WorkRoot = ""
 
 $script:StartedBridgeNow = $false
 $script:StartedNgrokNow = $false
@@ -138,6 +161,19 @@ function Exit-With([int]$Code, [string]$Message) {
     if ($Message) { Write-Fail $Message }
     Stop-StartedChildren
     exit $Code
+}
+
+function Require-EnvPath([string]$Name) {
+    # Returns the trimmed value of a required Windows path env var, or throws
+    # a diagnosable error. Every Join-Path/New-Item input that originates from
+    # the environment is validated here so an unset/empty variable can never
+    # surface as PowerShell's cryptic 'Cannot bind argument to parameter
+    # "Path" because it is an empty string' binding error.
+    $value = [Environment]::GetEnvironmentVariable($Name, "Process")
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "the required Windows path environment variable '$Name' is empty or unset; run this script from a normal Windows desktop session (set '$Name' and open a new terminal)"
+    }
+    return $value.Trim()
 }
 
 # ------------------------------------------------------------------ python
@@ -177,13 +213,19 @@ function Get-PythonCommand {
         return @{ Path = $pyCmd.Source; Extra = @("-3") }
     }
     # per-user python.org installs may not be on PATH yet; probe them directly
-    $userPython = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"
-    if (Test-PythonProbe $userPython @()) {
-        return @{ Path = $userPython; Extra = @() }
-    }
-    $userLauncher = Join-Path $env:LOCALAPPDATA "Programs\Python\Launcher\py.exe"
-    if (Test-PythonProbe $userLauncher @("-3")) {
-        return @{ Path = $userLauncher; Extra = @("-3") }
+    # (optional probe: skipped when LOCALAPPDATA is missing, never Join-Path'd
+    # with an empty value)
+    $localAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+        $localAppData = $localAppData.Trim()
+        $userPython = Join-Path $localAppData "Programs\Python\Python312\python.exe"
+        if (Test-PythonProbe $userPython @()) {
+            return @{ Path = $userPython; Extra = @() }
+        }
+        $userLauncher = Join-Path $localAppData "Programs\Python\Launcher\py.exe"
+        if (Test-PythonProbe $userLauncher @("-3")) {
+            return @{ Path = $userLauncher; Extra = @("-3") }
+        }
     }
     return $null
 }
@@ -230,7 +272,7 @@ function Ensure-Python {
         if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { $arch = "arm64" }
         $version = Get-LatestPython312
         $installerUrl = "https://www.python.org/ftp/python/$version/python-$version-$arch.exe"
-        $installer = Join-Path $env:TEMP "python-$version-$arch.exe"
+        $installer = Join-Path (Require-EnvPath "TEMP") "python-$version-$arch.exe"
         Write-Info "trying the official per-user installer: $installerUrl"
         try {
             Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
@@ -264,21 +306,26 @@ function Ensure-Python {
 # ------------------------------------------------------------------- codex
 function Find-Codex {
     # CODEX_BIN override > %APPDATA%\npm\codex.cmd > codex.exe / codex.cmd
-    # on PATH. Returns an absolute path or $null.
-    if ($env:CODEX_BIN) {
+    # on PATH. Returns an absolute path or $null. Env vars are validated
+    # before use so an empty value can never reach Join-Path/Test-Path.
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_BIN)) {
         if (Test-Path -LiteralPath $env:CODEX_BIN) { return $env:CODEX_BIN }
         Write-Fail "CODEX_BIN is set but not found: $env:CODEX_BIN"
         exit 3
     }
-    if ($env:APPDATA) {
-        $npmShim = Join-Path $env:APPDATA "npm\codex.cmd"
+    $appData = [Environment]::GetEnvironmentVariable("APPDATA", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($appData)) {
+        $npmShim = Join-Path $appData.Trim() "npm\codex.cmd"
         if (Test-Path -LiteralPath $npmShim) { return $npmShim }
     }
     $native = Get-Command codex.exe -ErrorAction SilentlyContinue
     if ($native) { return $native.Source }
     # official native installer default location (may not be on PATH yet)
-    $nativeLocal = Join-Path $env:USERPROFILE ".local\bin\codex.exe"
-    if (Test-Path -LiteralPath $nativeLocal) { return $nativeLocal }
+    $userProfile = [Environment]::GetEnvironmentVariable("USERPROFILE", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($userProfile)) {
+        $nativeLocal = Join-Path $userProfile.Trim() ".local\bin\codex.exe"
+        if (Test-Path -LiteralPath $nativeLocal) { return $nativeLocal }
+    }
     $shim = Get-Command codex.cmd -ErrorAction SilentlyContinue
     if ($shim) { return $shim.Source }
     return $null
@@ -333,15 +380,18 @@ function Ensure-Codex {
 
 # ------------------------------------------------------------------- ngrok
 function Get-NgrokExe {
-    if ($env:NGROK_BIN) {
+    if (-not [string]::IsNullOrWhiteSpace($env:NGROK_BIN)) {
         if (Test-Path -LiteralPath $env:NGROK_BIN) { return $env:NGROK_BIN }
         Write-Fail "NGROK_BIN is set but not found: $env:NGROK_BIN"
         return $null
     }
     $cmd = Get-Command ngrok.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $local = Join-Path $env:LOCALAPPDATA "ngrok\ngrok.exe"
-    if (Test-Path -LiteralPath $local) { return $local }
+    $localAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+        $local = Join-Path $localAppData.Trim() "ngrok\ngrok.exe"
+        if (Test-Path -LiteralPath $local) { return $local }
+    }
     return $null
 }
 
@@ -356,8 +406,8 @@ function Ensure-Ngrok {
         exit 6
     }
     Write-Info "ngrok not found; downloading the stable Windows build into %LOCALAPPDATA%\ngrok (no admin needed)"
-    $destDir = Join-Path $env:LOCALAPPDATA "ngrok"
-    $zip = Join-Path $env:TEMP "ngrok-v3-stable-windows-amd64.zip"
+    $destDir = Join-Path (Require-EnvPath "LOCALAPPDATA") "ngrok"
+    $zip = Join-Path (Require-EnvPath "TEMP") "ngrok-v3-stable-windows-amd64.zip"
     try {
         Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
             -OutFile $zip -UseBasicParsing
@@ -524,16 +574,37 @@ function Stop-StartedChildren {
 
 # ------------------------------------------------------------------- layout
 function Initialize-Layout {
-    $script:StateRootBase = ""
-    if ($env:BRIDGE_STATE_ROOT) {
-        $script:StateRootBase = $env:BRIDGE_STATE_ROOT
-    } elseif ($env:XDG_STATE_HOME) {
-        $script:StateRootBase = Join-Path $env:XDG_STATE_HOME "local-codex-bridge"
+    # All layout paths are derived HERE - after the environment sanity check
+    # at the top of main - and never at load time. Every input is validated
+    # (optional overrides are trimmed only when non-empty; the %LOCALAPPDATA%
+    # fallback is required) so an empty string can never reach Join-Path.
+    $stateOverride = [Environment]::GetEnvironmentVariable("BRIDGE_STATE_ROOT", "Process")
+    $xdgStateHome = [Environment]::GetEnvironmentVariable("XDG_STATE_HOME", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($stateOverride)) {
+        $script:StateRootBase = $stateOverride.Trim()
+    } elseif (-not [string]::IsNullOrWhiteSpace($xdgStateHome)) {
+        $script:StateRootBase = Join-Path $xdgStateHome.Trim() "local-codex-bridge"
     } else {
-        $script:StateRootBase = Join-Path $env:LOCALAPPDATA "local-codex-bridge"
+        $script:StateRootBase = Join-Path (Require-EnvPath "LOCALAPPDATA") "local-codex-bridge"
+    }
+    if ([string]::IsNullOrWhiteSpace($script:StateRootBase)) {
+        throw "the bridge state root resolved to an empty path (BRIDGE_STATE_ROOT/XDG_STATE_HOME/LOCALAPPDATA are all unset or empty)"
     }
     $script:InstanceDir = Join-Path $script:StateRootBase $script:Instance
     $script:RuntimeDir = Join-Path $script:InstanceDir "runtime"
+
+    # pid/log/instance files: built from the dirs above, never from the ""
+    # load-time placeholders (joining those used to abort every run with a
+    # 'parameter "Path" is an empty string' binding error).
+    $script:BridgePidFile = Join-Path $script:RuntimeDir "bridge.pid"
+    $script:NgrokPidFile = Join-Path $script:RuntimeDir "ngrok.pid"
+    $script:BridgeLog = Join-Path $script:RuntimeDir "bridge.log"
+    $script:BridgeOutLog = Join-Path $script:RuntimeDir "bridge.out.log"
+    $script:BridgeErrLog = Join-Path $script:RuntimeDir "bridge.err.log"
+    $script:NgrokLog = Join-Path $script:RuntimeDir "ngrok.log"
+    $script:NgrokOutLog = Join-Path $script:RuntimeDir "ngrok.out.log"
+    $script:NgrokErrLog = Join-Path $script:RuntimeDir "ngrok.err.log"
+    $script:InstanceJson = Join-Path $script:InstanceDir "instance.json"
 }
 
 # ------------------------------------------------------------------- bridge
@@ -698,9 +769,16 @@ function Invoke-BridgePhase {
 
     # CODEX_HOME is resolved before the secret check so its hints can name
     # the exact config path (param > env > %USERPROFILE%\.codex default).
-    if (-not $script:CodexHome) {
-        if ($env:CODEX_HOME) { $script:CodexHome = $env:CODEX_HOME }
-        else { $script:CodexHome = Join-Path $env:USERPROFILE ".codex" }
+    if ([string]::IsNullOrWhiteSpace($script:CodexHome)) {
+        $codexHomeEnv = [Environment]::GetEnvironmentVariable("CODEX_HOME", "Process")
+        if (-not [string]::IsNullOrWhiteSpace($codexHomeEnv)) {
+            $script:CodexHome = $codexHomeEnv.Trim()
+        } else {
+            $script:CodexHome = Join-Path (Require-EnvPath "USERPROFILE") ".codex"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($script:CodexHome)) {
+        throw "CODEX_HOME is empty; pass -CodexHome <dir> or set the CODEX_HOME environment variable and re-run"
     }
     Ensure-SecretEnvironment
     $script:CodexBin = Ensure-Codex
@@ -715,8 +793,8 @@ function Invoke-BridgePhase {
 
 # ------------------------------------------------------------------- ngrok
 function Resolve-TunnelDomain {
-    if ($Domain) { return $Domain.Trim() }
-    if ($env:NGROK_DOMAIN) { return $env:NGROK_DOMAIN.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($Domain)) { return $Domain.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:NGROK_DOMAIN)) { return $env:NGROK_DOMAIN.Trim() }
     return $script:FixedDomainDefault
 }
 
@@ -861,12 +939,14 @@ try {
         Invoke-Stop
         exit 0
     }
-    if ($CodexHome) { $script:CodexHome = $CodexHome }
-    if (-not $WorkRoot) {
-        if ($env:BRIDGE_WORK_ROOT) { $WorkRoot = $env:BRIDGE_WORK_ROOT }
+    if (-not [string]::IsNullOrWhiteSpace($CodexHome)) {
+        $script:CodexHome = $CodexHome.Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($WorkRoot)) {
+        if (-not [string]::IsNullOrWhiteSpace($env:BRIDGE_WORK_ROOT)) { $WorkRoot = $env:BRIDGE_WORK_ROOT.Trim() }
         else { $WorkRoot = "D:\work-of-jiaqi" }
     }
-    $script:WorkRoot = $WorkRoot
+    $script:WorkRoot = $WorkRoot.Trim()
     $python = Ensure-Python
     Invoke-BridgePhase
     if ($NoNgrok) {

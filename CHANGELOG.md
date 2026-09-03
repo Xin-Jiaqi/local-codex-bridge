@@ -36,6 +36,17 @@
   把“recovery 后 children 存活”断言改为有界等待——`recover_stack` 先记
   “recovery start”再执行 stop→start，原单次瞬时断言会偶发落入该窗口误报；
   等待窗口（20s）远小于 120s 重启 backoff，真实“恢复后不再拉起”仍会失败。
+- **Windows 空路径回归修复（windows-bootstrap 第三次提交，脚本版本
+  `windows-bootstrap-1.0.2`）**：`.ps1` 加载期在 `InstanceDir`/`RuntimeDir`
+  仍为空时就用 `Join-Path` 派生 pid/log/instance 路径，Windows PowerShell
+  5.1 会在 main 之前以 `Cannot bind argument to parameter 'Path' because it
+  is an empty string` 中止任何运行（含 `-Stop`）——即 `powershell.exe -File
+  ...\start_local_codex_bridge.ps1 -NoNgrok` 报“无法将参数绑定到参数
+  Path，因为该参数为空字符串”。改为加载期只保留 `""` 占位、路径全部在
+  `Initialize-Layout` 目录就绪后派生；`$PSScriptRoot`/RepoRoot、`CODEX_HOME`、
+  WorkRoot 及所有环境变量路径（LOCALAPPDATA/TEMP/USERPROFILE/APPDATA/
+  BRIDGE_STATE_ROOT/XDG_STATE_HOME/CODEX_HOME）逐一显式校验，空值给出
+  可诊断错误并补充 6 项静态回归测试；macOS 行为零改动。
 
 ## [1.1.0] - 2026-08-14
 

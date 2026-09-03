@@ -121,22 +121,26 @@ Windows 默认值（`start_local_codex_bridge.ps1` 可覆盖，env 优先）：
   （`config.toml` + `providers/` 等）从 Mac 拷贝过去即可复用，脚本只做
   "配置是否存在" 的提示，**不读取** `auth.json` / API key；
 - codex 可执行文件自动探测：`CODEX_BIN` > `%APPDATA%\npm\codex.cmd`（npm）
-  > PATH 上的原生 `codex.exe` / `codex.cmd`；检测不到时若 npm 存在会自动
-  `npm install -g @openai/codex`（用户前缀，无需管理员），仍失败则打印
-  原生安装命令；
+  > PATH 上的原生 `codex.exe` / `codex.cmd`；检测不到时自动安装：先 npm
+  用户前缀全局安装 `@openai/codex`，失败再走官方原生 Windows 安装器
+  （均免管理员，装后自动刷新 PATH 并继续），两条路都失败才打印最短命令；
 - 实例控制面状态在仓库外：`%LOCALAPPDATA%\local-codex-bridge\local\`
   （只含非 secret 字段的 `instance.json`、PID/日志），对应 macOS 的
   `${XDG_STATE_HOME:-$HOME/.local/state}/local-codex-bridge/<instance>/`。
   Windows bootstrap 面向 `local` 实例；hpc/maintenance 控制面仍是 macOS 功能。
 
-前置条件（脚本会检查并给最小处理）：
+前置条件（除 secret 外全部由脚本自动处理）：
 
-- **Python 3.8+**：缺失时不自动安装，打印 `winget install -e --id Python.Python.3.12`
-  或 python.org 安装器的最小步骤后退出；
-- **Codex CLI**（原生 Windows 安装推荐：`powershell -ExecutionPolicy ByPass -c
-  "irm https://chatgpt.com/codex/install.ps1 | iex"`，或 npm）；
-- **`DEEPSEEK_API_KEY`** 用户环境变量（`setx DEEPSEEK_API_KEY <key>` 后开新
-  Terminal；脚本只做存在性检查，不读取/打印 key）；
+- **Python 3.8+**：缺失时脚本自动安装——先 `winget install --scope user
+  Python.Python.3.12`（不请求管理员），winget 不可用/不支持 user scope 时改用
+  官方 python.org per-user 静默安装（`InstallAllUsers=0`，无 UAC），装完自动
+  刷新 PATH 并继续；两条路都失败才打印最短手工命令；
+- **Codex CLI**：缺失时脚本依次尝试 npm 全局安装（用户前缀）与官方原生
+  Windows 安装器（均免管理员），成功即继续；都失败才打印命令；
+- **`DEEPSEEK_API_KEY`**：脚本按 会话环境变量 → Windows 用户环境变量 顺序
+  读取（绝不打印值）；若只有 Codex config 而 key 缺失，交互式终端会弹一次
+  掩码输入（仅本会话），否则打印两行最短提示（不读取 `auth.json`）；也可
+  预先 `setx DEEPSEEK_API_KEY <key>` 后开新 Terminal 免输入；
 - **ngrok**（仅 cutover 需要）：缺失时脚本自动下载官方 Windows zip 到
   `%LOCALAPPDATA%\ngrok`（无需管理员）；authtoken 来自 `NGROK_AUTHTOKEN`
   环境变量或已有 `ngrok config`（`ngrok config check` 通过即可），脚本不读取、
@@ -510,7 +514,7 @@ tests/
   test_bridge_actions.py      集成测试：7 个 action（含 steer 排队语义）
   test_http_api.py            集成测试：HTTP API + openapi 校验（12 个场景）
   test_windows_support.py     离线单测：Windows 默认路径/codex 探测/npm shim 解析/argv 兼容
-                             （32 项：27 项任意平台可跑 + 5 项 Windows-only 平台条件测试）
+                             （36 项：31 项任意平台可跑 + 5 项 Windows-only 平台条件测试）
                              + PowerShell bootstrap 结构/secret 面静态检查
 .github/workflows/ci.yml   GitHub Actions：离线安全测试 + py_compile + bash -n + plist lint（无 secret/网络）
 openapi.yaml            公共 Actions 模板（servers URL 为占位符）
@@ -582,8 +586,8 @@ bootstrap 实机验证**（runtime 安装、LaunchAgent 装载、supervisor 实�
   BSD-3-Clause；tag `v1.0.0` 指向 `fa82e91`，**不移动**）。v1.0.0 发布版只有
   `workspace-write`（V1 边界）一个沙箱模式，没有实例 / cwd 守卫 / 多实例
   LaunchAgent。
-- 离线单测（当前可复现，无需 app-server，共 **286 项** = 原有 254 项 + 新增
-  32 项 windows 支持；macOS 本地：原有 4 项跳过 + 新增 5 项 Windows-only 跳过）：
+- 离线单测（当前可复现，无需 app-server，共 **290 项** = 原有 254 项 + 新增
+  36 项 windows 支持；macOS 本地：原有 4 项跳过 + 新增 5 项 Windows-only 跳过）：
   `tests/test_config_propagation.py`（3）、`tests/test_sandbox_mode.py`（7）、
   `tests/test_instance_isolation.py`（41）、`tests/test_workspace_guard.py`（19）、
   `tests/test_maintenance_instance.py`（52）、`tests/test_runtime_supervisor.py`（43）、
@@ -593,7 +597,7 @@ bootstrap 实机验证**（runtime 安装、LaunchAgent 装载、supervisor 实�
   `tests/test_activate_runtime_autorecovery.py`（11）、
   `tests/test_bootstrap_autorecovery_command.py`（11）、
   `tests/test_host_ops_lock.py`（11，single-writer host-ops lock）、
-  `tests/test_windows_support.py`（32：27 项任意平台 + 5 项 Windows-only 平台条件测试）。
+  `tests/test_windows_support.py`（36：31 项任意平台 + 5 项 Windows-only 平台条件测试）。
   跳过 9 项：pid guard 3 项 live-process（无 `ps` 的沙箱内跳过）+ git
   automation 1 项可选 sandbox 集成（需普通 Terminal + `RUN_SANDBOX_TESTS=1`）
   + windows_support 5 项 Windows-only（`os.name == "nt"` 才执行）。

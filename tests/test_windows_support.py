@@ -408,18 +408,73 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
         self.assertIn("Get-HealthJson \"/ready\"", self.source)
 
     def test_secret_values_are_never_echoed_or_written(self):
+        # Echoing cmdlets must never interpolate a secret variable. Backtick-
+        # escaped $env:DEEPSEEK_API_KEY inside double quotes is instructional
+        # text for the user ("$env:DEEPSEEK_API_KEY='<key>'"), not a value.
         echoing = re.compile(
             r"^\s*(Write-Host|Write-Info|Write-Fail|Write-Output|Write-Error|"
             r"Out-File|Set-Content|Add-Content|ConvertTo-Json).*", re.I
         )
+        value_echo = re.compile(r"(?<!`)\$env:(BRIDGE_API_KEY|NGROK_AUTHTOKEN|DEEPSEEK_API_KEY)")
         forbidden = []
         for lineno, line in enumerate(self.lines, 1):
             if not echoing.match(line):
                 continue
-            if ("$env:BRIDGE_API_KEY" in line or "$env:NGROK_AUTHTOKEN" in line
-                    or "$env:DEEPSEEK_API_KEY" in line):
+            if value_echo.search(line):
                 forbidden.append((lineno, line.strip()))
         self.assertEqual(forbidden, [])
+
+    def test_python_auto_install_paths_are_automated(self):
+        # Requirement: missing Python must be installed automatically, first
+        # via winget user scope, then the python.org per-user installer, then
+        # PATH is refreshed and startup continues (no admin/UAC).
+        self.assertNotIn("never auto-installs", self.source)
+        self.assertIn("Python.Python.3.12", self.source)
+        self.assertIn("--scope user", self.source)
+        self.assertIn("--accept-package-agreements", self.source)
+        self.assertIn("InstallAllUsers=0", self.source)
+        self.assertIn("PrependPath=1", self.source)
+        self.assertIn("Include_launcher=1", self.source)
+        self.assertIn("https://www.python.org/ftp/python/", self.source)
+        self.assertIn("function Refresh-PathFromRegistry", self.source)
+        # after an automatic install the script must re-detect and continue,
+        # not exit with a manual-python message
+        python_section = self.source[self.source.index("function Ensure-Python"):
+                                     self.source.index("# ------------------------------------------------------------------- codex")]
+        self.assertIn("$python = Get-PythonCommand", python_section)
+        self.assertIn("return $python", python_section)
+
+    def test_deepseek_key_user_env_and_masked_prompt(self):
+        # Key comes from session env, then the Windows USER env var; when a
+        # Codex config exists and only the key is missing, prompt once with a
+        # masked input; auth.json is never read.
+        self.assertIn('GetEnvironmentVariable("DEEPSEEK_API_KEY", "User")', self.source)
+        self.assertIn('Read-Host "DeepSeek API key" -AsSecureString', self.source)
+        self.assertIn("[Console]::IsInputRedirected", self.source)
+        self.assertIn("SecureStringToBSTR", self.source)
+        for lineno, line in enumerate(self.lines, 1):
+            if "auth.json" not in line:
+                continue
+            low = line.lower()
+            for reader in ("readalltext", "get-content", "invoke-restmethod",
+                           "invoke-webrequest"):
+                if reader in low:
+                    self.fail("auth.json read attempt at line %d: %s"
+                              % (lineno, line.strip()))
+            for writer in ("out-file", "set-content", "add-content"):
+                if writer in low:
+                    self.fail("auth.json write attempt at line %d: %s"
+                              % (lineno, line.strip()))
+
+    def test_codex_install_fallbacks_stay_automatic(self):
+        # npm global install first, then the official native installer, then
+        # PATH refresh and re-detection; instructions only as a last resort.
+        self.assertIn('npm.Source install -g "@openai/codex"', self.source)
+        self.assertGreaterEqual(self.source.count("chatgpt.com/codex/install.ps1"), 2)
+        auto_run = self.source.index('irm https://chatgpt.com/codex/install.ps1 | iex')
+        segment = self.source[auto_run:auto_run + 400]
+        self.assertIn("Refresh-PathFromRegistry", segment)
+        self.assertIn("Find-Codex", segment)
 
     def test_secrets_never_written_to_logs_or_pid_files(self):
         for lineno, line in enumerate(self.lines, 1):
@@ -449,6 +504,23 @@ class BootstrapScriptStructuralTest(unittest.TestCase):
                 continue
             if "Get-Content" in line and "bridge_api_key" in line.lower():
                 self.fail("key file read via Get-Content at line %d" % lineno)
+
+    def test_env_keys_defined_before_snapshot_helpers(self):
+        # Save-EnvSnapshot/Restore-Env iterate $script:EnvKeys; under
+        # Set-StrictMode an undefined script variable aborts the whole run,
+        # so the definition must exist and precede its first use.
+        self.assertIn("function Save-EnvSnapshot", self.source)
+        define = self.source.index("$script:EnvKeys = @(")
+        snapshot = self.source.index("function Save-EnvSnapshot")
+        self.assertLess(define, snapshot)
+        match = re.search(r"\$script:EnvKeys = @\((.*?)\)", self.source, re.S)
+        self.assertIsNotNone(match)
+        keys = re.findall(r'"([A-Z0-9_]+)"', match.group(1))
+        self.assertEqual(keys, [
+            "BRIDGE_API_KEY", "BRIDGE_INSTANCE", "BRIDGE_STATE_ROOT",
+            "BRIDGE_PORT", "BRIDGE_SANDBOX_MODE", "BRIDGE_APPROVAL_POLICY",
+            "BRIDGE_NETWORK_ACCESS", "CODEX_HOME", "CODEX_BIN", "PYTHONUTF8",
+        ])
 
 
 if __name__ == "__main__":

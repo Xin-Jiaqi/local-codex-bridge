@@ -5,10 +5,13 @@
 .DESCRIPTION
     Windows bootstrap for the Local Codex Bridge (macOS behavior unchanged).
 
-    * Checks and installs the lightweight dependencies: Codex CLI via npm
-      (user prefix, no admin), ngrok into %LOCALAPPDATA%\ngrok (no admin).
-      Python is never auto-installed: when it is missing the script prints
-      the minimal manual fix and exits.
+    * Checks and installs the dependencies without admin: Python 3.8+ is
+      installed automatically - winget first (--scope user), then the
+      official python.org per-user installer (silent, no UAC); PATH is
+      refreshed from the registry and startup continues. Codex CLI via npm
+      (user prefix) or the official native installer; ngrok into
+      %LOCALAPPDATA%\ngrok. If an automatic install is impossible, the
+      script prints the shortest manual fallback and exits.
     * Creates the default work root D:\work-of-jiaqi when missing.
     * Starts the bridge on 127.0.0.1:8321 (python -m http_server) with the
       SAME HTTP API as macOS: /health /ready /start /continue /observe
@@ -22,7 +25,10 @@
     DeepSeek provider config.toml there; this script never reads auth.json or
     any secret file), codex detection order = $env:CODEX_BIN,
     %APPDATA%\npm\codex.cmd (npm), codex.exe on PATH (native), codex.cmd on
-    PATH. Instance state lives OUTSIDE the repo under
+    PATH. The DeepSeek key is read from the session environment, falling back
+    to the Windows USER environment variable DEEPSEEK_API_KEY (never printed);
+    when only the key is missing and a Codex config exists, the script asks
+    for it once with a masked prompt. Instance state lives OUTSIDE the repo under
     %LOCALAPPDATA%\local-codex-bridge\local (mirror of the macOS control
     plane) and only contains non-secret fields.
 
@@ -55,8 +61,8 @@
     explicit absolute project directory outside the bridge control plane.
 
 .PARAMETER SkipAutoInstall
-    Never auto-install missing tools (npm codex, ngrok download); only
-    report what is missing.
+    Never auto-install missing tools (Python, npm/native codex, ngrok
+    download); only report what is missing.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1 -NoNgrok
@@ -81,7 +87,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------------ layout
-$script:Version = "windows-bootstrap-1.0.0"
+$script:Version = "windows-bootstrap-1.0.1"
 $script:FixedDomainDefault = "diploma-ideology-skier.ngrok-free.dev"
 $script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $script:Instance = "local"
@@ -135,28 +141,65 @@ function Exit-With([int]$Code, [string]$Message) {
 }
 
 # ------------------------------------------------------------------ python
+function Refresh-PathFromRegistry {
+    # Rebuild $env:PATH from the registry (machine + user + current session)
+    # so freshly installed tools are visible without opening a new terminal.
+    $parts = @()
+    foreach ($source in @($env:PATH,
+                          [Environment]::GetEnvironmentVariable("Path", "Machine"),
+                          [Environment]::GetEnvironmentVariable("Path", "User"))) {
+        if ($source) { $parts += $source -split ';' }
+    }
+    $env:PATH = (($parts | Where-Object { $_ } | Select-Object -Unique) -join ';')
+}
+
+function Test-PythonProbe([string]$Exe, [string[]]$Extra) {
+    # $true when $Exe runs and reports Python >= 3.8 (rejects store stubs).
+    if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $false }
+    $probe = "import sys; print('%d.%d' % sys.version_info[:2])"
+    try {
+        $out = & $Exe @Extra -c $probe 2>$null
+        return [bool]($out -match "^\s*3\.([89]|[1-9][0-9])")
+    } catch {
+        return $false
+    }
+}
+
 function Get-PythonCommand {
     # Returns @{ Path; Extra = @() | @("-3") } for Python >= 3.8, or $null.
-    # python.exe may be a WindowsApps store stub; the version probe filters
-    # it out (the probe also rejects anything that is not real Python).
-    $probe = "import sys; print('%d.%d' % sys.version_info[:2])"
     $pythonCmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($pythonCmd -and $pythonCmd.Source -notlike "*WindowsApps*") {
-        $extra = @()
-        $out = & $pythonCmd.Source @extra -c $probe 2>$null
-        if ($out -match "^\s*3\.([89]|[1-9][0-9])") {
-            return @{ Path = $pythonCmd.Source; Extra = $extra }
-        }
+    if ($pythonCmd -and $pythonCmd.Source -notlike "*WindowsApps*" -and
+        (Test-PythonProbe $pythonCmd.Source @())) {
+        return @{ Path = $pythonCmd.Source; Extra = @() }
     }
     $pyCmd = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($pyCmd) {
-        $extra = @("-3")
-        $out = & $pyCmd.Source @extra -c $probe 2>$null
-        if ($out -match "^\s*3\.([89]|[1-9][0-9])") {
-            return @{ Path = $pyCmd.Source; Extra = $extra }
-        }
+    if ($pyCmd -and (Test-PythonProbe $pyCmd.Source @("-3"))) {
+        return @{ Path = $pyCmd.Source; Extra = @("-3") }
+    }
+    # per-user python.org installs may not be on PATH yet; probe them directly
+    $userPython = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"
+    if (Test-PythonProbe $userPython @()) {
+        return @{ Path = $userPython; Extra = @() }
+    }
+    $userLauncher = Join-Path $env:LOCALAPPDATA "Programs\Python\Launcher\py.exe"
+    if (Test-PythonProbe $userLauncher @("-3")) {
+        return @{ Path = $userLauncher; Extra = @("-3") }
     }
     return $null
+}
+
+function Get-LatestPython312 {
+    # Newest published 3.12.x from the official directory listing; falls back
+    # to a known-good pinned patch when the listing is unreachable.
+    try {
+        $page = (Invoke-WebRequest -Uri "https://www.python.org/ftp/python/" `
+            -UseBasicParsing -TimeoutSec 20).Content
+        $latest = [regex]::Matches($page, 'href="(3\.12\.\d+)/"') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object { [version]$_ } | Select-Object -Last 1
+        if ($latest) { return $latest }
+    } catch { }
+    return "3.12.10"
 }
 
 function Ensure-Python {
@@ -165,15 +208,57 @@ function Ensure-Python {
         Write-Info "python: $($python.Path)"
         return $python
     }
-    Write-Fail "Python 3.8+ was not found; the bridge needs Python and this script never auto-installs it."
-    Write-Host ""
-    Write-Host "Minimal fix (no admin needed with the python.org installer):"
-    Write-Host "  1.  winget install -e --id Python.Python.3.12"
-    Write-Host "      (or download https://www.python.org/downloads/ and run the installer,"
-    Write-Host "       ticking 'Add python.exe to PATH')"
-    Write-Host "  2.  Close this terminal, open a new one, re-run this script."
-    Write-Host ""
-    Exit-With 2
+    if ($SkipAutoInstall) {
+        Write-Fail "Python 3.8+ was not found and -SkipAutoInstall is set; install it (winget install -e --id Python.Python.3.12, or https://www.python.org/downloads/) and re-run."
+        exit 2
+    }
+    Write-Info "Python 3.8+ not found; attempting an automatic per-user install (no admin/UAC)"
+
+    # 1) winget, user scope only - never asks for machine-wide elevation
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Info "trying winget: install -e --id Python.Python.3.12 --scope user (silent)"
+        & $winget.Source install -e --id Python.Python.3.12 --scope user --silent `
+            --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -eq 0) { Refresh-PathFromRegistry }
+        $python = Get-PythonCommand
+    }
+
+    # 2) official python.org per-user installer (silent, no UAC)
+    if (-not $python) {
+        $arch = "amd64"
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { $arch = "arm64" }
+        $version = Get-LatestPython312
+        $installerUrl = "https://www.python.org/ftp/python/$version/python-$version-$arch.exe"
+        $installer = Join-Path $env:TEMP "python-$version-$arch.exe"
+        Write-Info "trying the official per-user installer: $installerUrl"
+        try {
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+            $installProc = Start-Process -FilePath $installer `
+                -ArgumentList "/quiet", "InstallAllUsers=0", "PrependPath=1", `
+                    "Include_launcher=1", "Include_test=0" `
+                -Wait -PassThru -WindowStyle Hidden
+            if ($installProc.ExitCode -ne 0) {
+                Write-Fail "python.org installer exited with code $($installProc.ExitCode)"
+            }
+        } catch {
+            Write-Fail "automatic Python install failed: $_"
+        } finally {
+            Refresh-PathFromRegistry
+        }
+        $python = Get-PythonCommand
+    }
+
+    if ($python) {
+        Write-Info "python ready: $($python.Path)"
+        return $python
+    }
+    Write-Fail "Python 3.8+ could not be installed automatically."
+    Write-Host "Manual fallback (one time, still no admin):"
+    Write-Host "  winget install -e --id Python.Python.3.12"
+    Write-Host "or run the installer from https://www.python.org/downloads/ and tick 'Add python.exe to PATH'."
+    Write-Host "Then re-run this script."
+    exit 2
 }
 
 # ------------------------------------------------------------------- codex
@@ -191,6 +276,9 @@ function Find-Codex {
     }
     $native = Get-Command codex.exe -ErrorAction SilentlyContinue
     if ($native) { return $native.Source }
+    # official native installer default location (may not be on PATH yet)
+    $nativeLocal = Join-Path $env:USERPROFILE ".local\bin\codex.exe"
+    if (Test-Path -LiteralPath $nativeLocal) { return $nativeLocal }
     $shim = Get-Command codex.cmd -ErrorAction SilentlyContinue
     if ($shim) { return $shim.Source }
     return $null
@@ -203,6 +291,7 @@ function Ensure-Codex {
         return $codexBin
     }
     if (-not $SkipAutoInstall) {
+        # 1) npm global install (user prefix %APPDATA%\npm, no admin)
         $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
         if ($npm) {
             Write-Info "codex not found; installing @openai/codex via npm (user prefix, no admin needed)"
@@ -215,13 +304,29 @@ function Ensure-Codex {
                 }
             }
         }
+        # 2) official native Windows installer (user scope, no admin)
+        if (-not $codexBin) {
+            Write-Info "codex not found via npm; trying the official native Windows installer"
+            try {
+                powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                    -Command "irm https://chatgpt.com/codex/install.ps1 | iex"
+                Refresh-PathFromRegistry
+            } catch {
+                Write-Fail "native codex installer failed: $_"
+            }
+            $codexBin = Find-Codex
+            if ($codexBin) {
+                Write-Info "codex installed: $codexBin"
+                return $codexBin
+            }
+        }
     }
     Write-Fail "Codex CLI was not found (set CODEX_BIN or add codex to PATH)."
     Write-Host ""
-    Write-Host "Install the native Windows build (recommended):"
+    Write-Host "Manual fallback:"
     Write-Host "  powershell -ExecutionPolicy ByPass -c `"irm https://chatgpt.com/codex/install.ps1 | iex`""
-    Write-Host "or, when Node.js is installed:  npm install -g @openai/codex"
-    Write-Host "then re-run this script."
+    Write-Host "or:  npm install -g @openai/codex     (when Node.js is installed)"
+    Write-Host "Then re-run this script."
     Write-Host ""
     exit 3
 }
@@ -276,6 +381,8 @@ function Ensure-Ngrok {
 
 # --------------------------------------------------- secrets (presence only)
 function Ensure-SecretEnvironment {
+    # API key for the HTTP endpoints (.bridge_api_key, gitignored). The key
+    # content is only ever loaded into an env var for the child process.
     if (-not (Test-Path -LiteralPath $script:KeyFile)) {
         $bytes = New-Object byte[] 32
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -291,19 +398,54 @@ function Ensure-SecretEnvironment {
             Exit-With 4 "the API key file exists but is empty: $($script:KeyFile) (delete it and re-run, or copy the Mac key)"
         }
     }
+
+    # DeepSeek provider key: session env -> Windows USER env var -> masked
+    # one-time prompt. The value is never printed and auth.json is never read.
     if ([string]::IsNullOrWhiteSpace($env:DEEPSEEK_API_KEY)) {
-        Write-Fail "DEEPSEEK_API_KEY is not set in this session; the bridge cannot reach DeepSeek."
-        Write-Host ""
-        Write-Host "Minimal fix (presence check only; the key is never read or printed by this script):"
-        Write-Host "  1.  setx DEEPSEEK_API_KEY <your-deepseek-key>"
-        Write-Host "      (or add it under Windows user Environment Variables; the key stays in your"
-        Write-Host "       Codex config/auth files and user environment - never in this repo)"
-        Write-Host "  2.  Open a NEW terminal and re-run this script."
-        Write-Host ""
-        Exit-With 4
+        $userKey = [Environment]::GetEnvironmentVariable("DEEPSEEK_API_KEY", "User")
+        if (-not [string]::IsNullOrWhiteSpace($userKey)) {
+            $env:DEEPSEEK_API_KEY = $userKey
+            $userKey = $null
+            Write-Info "DEEPSEEK_API_KEY: imported from the Windows user environment (value never printed)"
+        }
     }
-    if ([string]::IsNullOrWhiteSpace($env:APPDATA) -or [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -or [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        Exit-With 4 "APPDATA / LOCALAPPDATA / USERPROFILE are required (run this from a normal Windows user session)"
+    if ([string]::IsNullOrWhiteSpace($env:DEEPSEEK_API_KEY)) {
+        $configExists = Test-Path -LiteralPath (Join-Path $script:CodexHome "config.toml")
+        $canPrompt = -not [Console]::IsInputRedirected
+        if ($configExists -and $canPrompt) {
+            Write-Info "DEEPSEEK_API_KEY is not set; a Codex config exists under $script:CodexHome. Paste the DeepSeek key once (masked, session-only) or press Enter to skip:"
+            $secure = Read-Host "DeepSeek API key" -AsSecureString
+            if ($secure -and $secure.Length -gt 0) {
+                $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+                $plain = $null
+                try {
+                    $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+                } finally {
+                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                }
+                if (-not [string]::IsNullOrWhiteSpace($plain)) {
+                    $env:DEEPSEEK_API_KEY = $plain
+                    $plain = $null
+                    Write-Info "DEEPSEEK_API_KEY accepted for this session (never written to disk by this script)"
+                    Write-Host "To skip this prompt next time: setx DEEPSEEK_API_KEY <your-deepseek-key>  (then open a new terminal)"
+                }
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($env:DEEPSEEK_API_KEY)) {
+        # Only the user-typed secret can block the bootstrap; everything else
+        # is automated. auth.json is never read and no value is printed.
+        if (Test-Path -LiteralPath (Join-Path $script:CodexHome "config.toml")) {
+            Write-Fail "DEEPSEEK_API_KEY is not set (Codex config found under $script:CodexHome)."
+            Write-Host "Set it and re-run:  `$env:DEEPSEEK_API_KEY='<your-deepseek-key>'"
+            Write-Host "or persist once:    setx DEEPSEEK_API_KEY <your-deepseek-key>   (then open a new terminal)"
+        } else {
+            Write-Fail "DEEPSEEK_API_KEY is not set and no Codex config exists under $script:CodexHome."
+            Write-Host "Copy config.toml + providers/ from your Mac profile into $script:CodexHome, then set:"
+            Write-Host "  `$env:DEEPSEEK_API_KEY='<your-deepseek-key>'   (or: setx DEEPSEEK_API_KEY <your-deepseek-key>)"
+        }
+        Write-Host "The key value is never printed by this script; auth.json is never read."
+        Exit-With 4
     }
 }
 
@@ -554,12 +696,14 @@ function Invoke-BridgePhase {
         }
     }
 
-    Ensure-SecretEnvironment
-    $script:CodexBin = Ensure-Codex
+    # CODEX_HOME is resolved before the secret check so its hints can name
+    # the exact config path (param > env > %USERPROFILE%\.codex default).
     if (-not $script:CodexHome) {
         if ($env:CODEX_HOME) { $script:CodexHome = $env:CODEX_HOME }
         else { $script:CodexHome = Join-Path $env:USERPROFILE ".codex" }
     }
+    Ensure-SecretEnvironment
+    $script:CodexBin = Ensure-Codex
     $configCheck = Join-Path $script:CodexHome "config.toml"
     if (-not (Test-Path -LiteralPath $configCheck)) {
         Write-Info "note: $configCheck does not exist yet; copy your DeepSeek provider config (config.toml + providers/) from the Mac profile into $script:CodexHome before the first real /start"

@@ -897,8 +897,14 @@ class SupervisorRuntimeTest(unittest.TestCase):
             self.assertTrue(wait_for(
                 lambda: count_sup_lines(self.state, "recovery start: local readiness failure") >= 1,
                 timeout=20), "readiness failure triggers a full recovery")
-            self.assertTrue(pid_alive(read_pid(self.state, "bridge")),
-                            "children stay up after recovery")
+            # recover_stack logs "recovery start" BEFORE its stop->start
+            # cycle, so children are legitimately down at that instant; wait
+            # (bounded, far below the 120s restart backoff) for them to come
+            # back up - a recovery that never restarts the stack still fails.
+            self.assertTrue(wait_for(
+                lambda: pid_alive(read_pid(self.state, "bridge")) and
+                pid_alive(read_pid(self.state, "ngrok")), timeout=20),
+                "children stay up after recovery")
             with open(ready_file, "w") as fh:
                 fh.write("1")
             self.assertTrue(wait_for(

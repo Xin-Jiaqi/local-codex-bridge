@@ -6,7 +6,8 @@
 ## [Unreleased]
 
 > 状态：分支 `windows-bootstrap` 上的 Windows 扩展，未发布、未 push 到
-> origin；main / v1.1.0 行为不变。HTTP API 无任何改动。
+> origin/main；第一版提交已 push 到 `origin/windows-bootstrap`。main /
+> v1.1.0 行为不变。HTTP API 无任何改动。
 
 - **Windows 原生 bootstrap（windows-bootstrap）**：PowerShell + Windows Python
   + Windows Codex CLI，不改协议；默认工作根 `D:\work-of-jiaqi`、CODEX_HOME
@@ -23,6 +24,18 @@
 - **测试/CI**：`tests/test_windows_support.py` 32 项（27 项任意平台 + 5 项
   Windows-only 平台条件测试 + PowerShell 静态 secret 面检查），已加入离线
   CI 集合与 py_compile。
+
+- **bootstrap 零手工增强（windows-bootstrap 第二次提交）**：Python 缺失时
+  自动安装（winget `--scope user` → python.org per-user 静默安装，均免
+  管理员/UAC），装后刷新 PATH 继续；codex 缺失时 npm 失败后自动转官方原生
+  安装器；DEEPSEEK_API_KEY 按 会话 → Windows 用户环境变量 读取，仅剩 key
+  缺失且存在 Codex config 时弹一次掩码输入（不读 `auth.json`、不打印值）；
+  tests/test_windows_support.py 增至 36 项（31 项任意平台 + 5 项
+  Windows-only），README 同步。
+- **测试健壮性（同第二次提交）**：`test_runtime_supervisor` 的本地恢复用例
+  把“recovery 后 children 存活”断言改为有界等待——`recover_stack` 先记
+  “recovery start”再执行 stop→start，原单次瞬时断言会偶发落入该窗口误报；
+  等待窗口（20s）远小于 120s 重启 backoff，真实“恢复后不再拉起”仍会失败。
 
 ## [1.1.0] - 2026-08-14
 

@@ -185,6 +185,58 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridg
   用户自配任务计划程序）；`ngrok`/key/authtoken 相关 secret 绝不落日志或
   PID/instance 文件。
 
+## Mac → Windows cutover helper（windows-bootstrap）
+
+把 Mac 的 bridge 凭据一次性搬到 Windows 的最小助手（小范围新增，不改 macOS
+脚本）。只有两个迁移物，全部在 Mac 内存中打包加密、绝不打印到
+stdout/stderr/日志：
+
+- `.bridge_api_key`（仓库根；默认路径可用 `--bridge-key-file` 覆盖）；
+- 当前 ngrok 用户 config（默认 `~/.config/ngrok/ngrok.yml`，其次
+  `~/.ngrok2/ngrok.yml`，可用 `--ngrok-config` 覆盖）里的 authtoken——同账号
+  即可接管固定域名（bridge 启动方式是 `ngrok http 8321 --url <固定域名>`，
+  不需要迁移 tunnels 段）。可选读取 `.ngrok_domain` 只为提示域名是否与
+  Windows 默认不同，域名本身不是 secret。
+
+实现要点（Python stdlib + Windows PowerShell/.NET 内置 AES，无第三方依赖）：
+
+- 随机一次性 AES-256 密钥：AES-256-CBC（随机 IV + PKCS#7）+ HMAC-SHA256
+  认证（纯 Python FIPS-197 实现，带 KAT 测试）；
+- Mac 只启动绑定局域网 IPv4 的临时 HTTP 服务：随机高端口、随机路径 token、
+  最多存活 600 秒、只允许下载一次（下载后立即退出）、没有任何明文端点；
+- 一次性传输密钥只在该命令内出现一次，服务器退出后即作废——复制到 Windows
+  后不要保存、不要发给 AI/聊天工具；
+- Windows 端单条 PowerShell 命令：下载 → HMAC 校验 → .NET AES-256 解密 →
+  校验 key 为 64 hex 且 SHA256 与 Mac 相同（只比较 hash）→ 原子写入
+  `D:\work-of-jiaqi\actions-bridge\.bridge_api_key`（去尾随换行；临时文件先
+  `icacls` 收紧为当前用户再 rename）→ ngrok config 写入
+  `%USERPROFILE%\.config\ngrok\ngrok.yml`（已存在则先备份
+  `ngrok.yml.bak-<ts>`）→ `ngrok config check` 验证 → 删除全部临时
+  明文/密文。全程不打印 bridge key 与 authtoken；
+- 不自动停 Mac ngrok（保持控制链）：Windows 接管固定域名成功后再在 Mac 上
+  `./scripts/stop_ngrok_bridge.sh`。
+
+用法（Mac，仓库根；命令会打印 hash、一次性传输密钥与 Windows 端命令）：
+
+```bash
+python3 scripts/prepare_macos_cutover.py
+```
+
+把 `----- BEGIN PowerShell -----` 与 `----- END PowerShell -----` 之间的整段
+粘贴到 Windows PowerShell（5.1+）执行。输出含：
+
+```text
+[cutover] key: 64 hex, SHA256 <64位hash> (matches Mac: True)
+[cutover] ngrok config check: OK
+```
+
+然后按原 cutover 顺序：Windows 端运行
+`powershell -ExecutionPolicy Bypass -File scripts\windows\start_local_codex_bridge.ps1`
+（域名与 Mac 不同时加 `-Domain <域名>`）→ 成功后 Mac 端停 ngrok。若 Windows
+仓库不在 `D:\work-of-jiaqi\actions-bridge`，重新生成时用
+`--windows-key-path` 覆盖目标路径。测试：
+`python3 -m pytest tests/test_prepare_macos_cutover.py -q`。
+
 ## 实例：local / hpc / maintenance（控制面隔离）
 
 从 1.1.0 起，Bridge 进程在启动时被 `BRIDGE_INSTANCE`（默认 `local`）**钉扎**到唯一

@@ -35,6 +35,7 @@ from bridge.worker import (
     WorkerConfigError,
     _poll_router,
     execute_job,
+    map_posix_cwd,
 )
 
 
@@ -369,6 +370,37 @@ class WorkerRouterCompatTest(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class PosixCwdMapTest(unittest.TestCase):
+    """WORKER_POSIX_MNT_MAP drive-letter -> /mnt/<drive> mapping (WSL worker)."""
+
+    def setUp(self):
+        self._old = os.environ.get("WORKER_POSIX_MNT_MAP")
+        os.environ["WORKER_POSIX_MNT_MAP"] = "1"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("WORKER_POSIX_MNT_MAP", None)
+        else:
+            os.environ["WORKER_POSIX_MNT_MAP"] = self._old
+
+    def test_maps_drive_absolute_cwd(self):
+        self.assertEqual(
+            "/mnt/d/work-of-jiaqi/projects",
+            map_posix_cwd("D:\\work-of-jiaqi\\projects"),
+        )
+        self.assertEqual(
+            "/mnt/c/x/y", map_posix_cwd("C:/x/y")
+        )
+
+    def test_passthrough_without_env(self):
+        os.environ.pop("WORKER_POSIX_MNT_MAP", None)
+        self.assertEqual("D:\\x", map_posix_cwd("D:\\x"))
+
+    def test_posix_and_unc_passthrough(self):
+        self.assertEqual("/home/u/p", map_posix_cwd("/home/u/p"))
+        self.assertEqual("\\\\wsl$\\Ubuntu\\home", map_posix_cwd("\\\\wsl$\\Ubuntu\\home"))
 
 
 if __name__ == "__main__":

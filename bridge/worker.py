@@ -23,6 +23,11 @@ Safety properties (mirrored on the router side in bridge/dual_host.py):
 - logs contain only timestamps / job ids / kinds / status codes - never
   prompts, API keys or tokens
 
+POSIX worker hosts (WSL): with WORKER_POSIX_MNT_MAP=1 a /start cwd such as
+``D:\\work\\x`` is mapped to ``/mnt/d/work/x`` before the local bridge call,
+so a Linux local bridge executes jobs the router addressed to the Windows
+machine (router-side thread mapping is unchanged).
+
 Run:  python -m bridge.worker --router-url https://<mac>.ngrok-free.dev
       (token / local key via env BRIDGE_WORKER_TOKEN / BRIDGE_API_KEY or args)
 """
@@ -63,6 +68,32 @@ KIND_READ_TIMEOUT_S = {
     "list": 30.0,
 }
 MAX_BACKOFF_S = 30.0
+
+_WIN_DRIVE_RE = None
+
+
+def _compile_win_drive_re():
+    global _WIN_DRIVE_RE
+    if _WIN_DRIVE_RE is None:
+        import re as _re
+        _WIN_DRIVE_RE = _re.compile(r"^([A-Za-z]):[\\/](.*)$", _re.S)
+
+
+def map_posix_cwd(cwd):
+    """Map a Windows drive-absolute cwd to /mnt/<drive>/... on POSIX hosts.
+
+    Active only when WORKER_POSIX_MNT_MAP is truthy (1/true/yes); non-drive
+    paths (UNC, bare drive, POSIX) pass through unchanged.
+    """
+    if os.environ.get("WORKER_POSIX_MNT_MAP", "").strip().lower() not in ("1", "true", "yes"):
+        return cwd
+    if not isinstance(cwd, str) or not cwd.strip():
+        return cwd
+    _compile_win_drive_re()
+    m = _WIN_DRIVE_RE.match(cwd.strip())
+    if not m:
+        return cwd
+    return "/mnt/%s/%s" % (m.group(1).lower(), m.group(2).replace("\\", "/"))
 
 
 class WorkerConfigError(Exception):
@@ -110,6 +141,12 @@ def execute_job(job, local_base_url, local_api_key, log=_log):
     params = job.get("params") or {}
     if not isinstance(params, dict):
         return _error_result(job_id, 400, "job params must be a JSON object")
+    if kind == "start" and isinstance(params.get("cwd"), str):
+        mapped = map_posix_cwd(params["cwd"])
+        if mapped != params["cwd"]:
+            params = dict(params)
+            params["cwd"] = mapped
+            log("job %s: mapped local cwd for POSIX execution" % (job_id,))
     timeout = KIND_READ_TIMEOUT_S.get(kind, 30.0)
     if kind == "observe":
         try:

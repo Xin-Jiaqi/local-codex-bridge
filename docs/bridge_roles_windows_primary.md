@@ -42,6 +42,11 @@ ChatGPT (Custom GPT Actions)
   `touch $SD/ngrok.enable` (supervisor brings the tunnel up within ~15 s;
   public URL stays the same domain, so the ChatGPT Action URL is unchanged).
 
+## One-shot cutover script
+ (Mac terminal, run once): moves the static
+ngrok domain from Mac to the WSL ngrok on the SAME public URL with preflight,
+~60s public-health poll, harmless public /start->/observe WSL-evidence check,
+and automatic rollback on any failure. See its header + README section.
 ## Verification (2026-09-04 MVP)
 - Windows router /health: ready, dual_host worker_online=true.
 - Harmless end-to-end (public-URL test pending domain cutover; private loop PASS):

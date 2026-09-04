@@ -739,3 +739,22 @@ bootstrap 实机验证**（runtime 安装、LaunchAgent 装载、supervisor 实�
   5 项 Windows-only（`os.name == "nt"` 才执行）。CI 跑同一集合（集成验证除外）。
 - 集成测试需要真实 app-server + DeepSeek key，无 CI 自动化、未在发布后复跑：`python3 tests/test_bridge_core.py`、`python3 tests/test_bridge_actions.py`、`python3 tests/test_http_api.py`。最近一次完整实测（2026-08-11）为全 PASS：core 5/5、actions 7/7、HTTP API 11/11、公网 tunnel 6/6（历史记录）。当前 `test_http_api.py` 含 12 个唯一场景（含 openapi 校验，部署副本缺失/占位按通过处理），与历史记录的差异未复跑确认。
 - 已实测能力：start/continue/observe/steer/interrupt/list/read、本地读写、shell、native thread 连续工作、Bearer API Key、workspace-write + approval_policy=on-request、Bridge/ngrok 后台启动、PID 管理、stop 隔离、health checks、完整 stop→start→health 生命周期；runtime install/uninstall、supervisor enable/disable、crash 补起、pause-resume 与 maintenance 交接在 temp-dir 离线测试验证；2026-08-14 真实 host round-trip 已实机验证 runtime 安装、LaunchAgent 装载、supervisor 实机运行与真实 bridge crash-recovery（见 `docs/release-validation-v1.1.0.md` 第 3 节）。
+
+## One-shot PRIMARY cutover (Mac -> Windows/WSL, same public URL)
+
+When the Windows/WSL PRIMARY stack is verified (router 127.0.0.1:8321
+`worker_online=true`, WSL worker up), run ONCE on the Mac terminal to move
+the single ngrok static domain (`diploma-ideology-skier.ngrok-free.dev`) to
+the WSL Linux ngrok without changing the public URL:
+
+    ./scripts/cutover_primary_to_wsl.sh
+
+Preflight aborts with exit 2 before touching anything when the Windows
+router/worker is not healthy. The script SIGSTOPs the Mac supervisor
+transiently (resumed on exit), stops only the Mac ngrok child, activates the
+WSL ngrok via the `ngrok.enable` flag, polls the public `/health` (~60s max),
+then runs a harmless read-only `/start -> /observe` through the public URL and
+requires WSL/Linux evidence. Any failure auto-rolls-back (WSL ngrok off +
+flag removed, Mac supervisor resumed, public health re-verified). Secrets are
+never printed or committed; logs: `~/.local/state/local-codex-bridge/local/runtime/cutover_primary_to_wsl.log`.
+See `docs/bridge_roles_windows_primary.md` for the PRIMARY/SECONDARY layout.
